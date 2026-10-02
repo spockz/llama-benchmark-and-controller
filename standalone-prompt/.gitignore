@@ -1,0 +1,2 @@
+# Keep each standalone trial and its isolated client state out of the reusable fixture bundle.
+runs/

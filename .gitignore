@@ -1,0 +1,13 @@
+# Go build and test caches.
+.scratch/
+.DS_Store
+/bin/
+
+# Benchmark outputs are large and machine-specific. Keep only the reusable
+# IQ4_NL vs IQ4_XS setup files in the initial shareable repository.
+/benchmark-runs/*
+!/benchmark-runs/iq4-nl-vs-xs-full-grid-20260929/
+/benchmark-runs/iq4-nl-vs-xs-full-grid-20260929/*
+!/benchmark-runs/iq4-nl-vs-xs-full-grid-20260929/README.md
+!/benchmark-runs/iq4-nl-vs-xs-full-grid-20260929/matrix.json
+!/benchmark-runs/iq4-nl-vs-xs-full-grid-20260929/run.sh

@@ -1,0 +1,122 @@
+version: "2"
+
+run:
+  timeout: 5m
+  issues-exit-code: 1
+  tests: true
+  modules-download-mode: readonly
+
+output:
+  formats:
+    text:
+      path: stdout
+      print-issued-lines: true
+      print-linter-name: true
+      colors: true
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - errname
+    - gochecksumtype
+    - gocognit
+    - goconst
+    - exhaustive
+    - funlen
+    - govet
+    - iotamixing
+    - ineffassign
+    - mirror
+    - nakedret
+    - nilnesserr
+    - nilnil
+    - staticcheck
+    - reassign
+    - tagalign
+    - wastedassign
+    - unused
+    - revive
+    - gocritic
+    - misspell
+    - bodyclose
+    - noctx
+    - prealloc
+    - gosec
+    - unconvert
+    - errorlint
+    - nilerr
+    - unparam
+    - intrange
+    - modernize
+    - copyloopvar
+    - nolintlint
+    - durationcheck
+    - makezero
+    - usestdlibvars
+    - dupl
+    - embeddedstructfieldcheck
+  settings:
+    goconst:
+      ignore-tests: true
+      match-constant: false
+      min-len: 10
+      min-occurrences: 5
+    gocognit:
+      min-complexity: 80
+    funlen:
+      lines: -1
+      statements: 100
+    exhaustive:
+      default-signifies-exhaustive: true
+    govet:
+      enable-all: true
+      disable:
+        - fieldalignment
+        - shadow
+    revive:
+      rules:
+        - name: exported
+          arguments: [disableStutteringCheck]
+        - name: blank-imports
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: dot-imports
+        - name: error-return
+        - name: error-strings
+        - name: error-naming
+        - name: if-return
+        - name: increment-decrement
+        - name: var-naming
+        - name: var-declaration
+        - name: package-comments
+        - name: range
+        - name: receiver-naming
+        - name: time-naming
+        - name: unexported-return
+        - name: indent-error-flow
+        - name: errorf
+    errorlint:
+      errorf: true
+      asserts: true
+      comparison: true
+    gosec:
+      excludes:
+        - G104
+    misspell:
+      locale: US
+      ignore-rules:
+        - cancelled
+  exclusions:
+    presets: []
+    rules:
+      - path: _test\.go
+        linters:
+          - gosec
+          - errcheck
+          - noctx
+          - nilnil
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

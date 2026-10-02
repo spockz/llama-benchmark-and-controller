@@ -1,0 +1,19 @@
+{
+  "models": [
+    "unsloth/Qwen3.6-35B-A3B-GGUF:UD-IQ4_NL",
+    "unsloth/Qwen3.6-35B-A3B-GGUF:UD-IQ4_XS"
+  ],
+  "contexts": [65536, 131072, 204800],
+  "threads": [6, 8, 12],
+  "parallel": [1, 2],
+  "batches": [256, 512, 2048],
+  "ubatches": [512],
+  "fit_targets": [256],
+  "cache_reuse": [0],
+  "flash_attention": ["on"],
+  "unified_kv": [true],
+  "kv_per_slot": [204800],
+  "kv_k": ["q5_1"],
+  "kv_v": ["q5_1"],
+  "preserve_thinking": [false]
+}

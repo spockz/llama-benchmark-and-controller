@@ -1,0 +1,17 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "amdbeast": {
+      "name": "AMD Beast",
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "http://192.168.1.122:1234/v1"
+      },
+      "models": {
+        "qwen36-coder": {
+          "name": "Qwen 3.6 Coder"
+        }
+      }
+    }
+  }
+}
