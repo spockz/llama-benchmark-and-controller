@@ -18,6 +18,37 @@ make vet
 The executable is `bin/llama-bench-harness`. The default llama.cpp checkout is
 `../llama.cpp`; pass `--workdir /path/to/llama.cpp` when it lives elsewhere.
 
+## Build llama.cpp
+
+The harness does not build llama.cpp itself. The repository includes a helper
+Makefile at [`Makefile-llama`](Makefile-llama) with separate Vulkan and ROCm
+builds. Copy it from this repository into the llama.cpp checkout under its own
+name so the upstream `Makefile` stays untouched:
+
+```sh
+cp /path/to/tune-llama-cpp/Makefile-llama /path/to/llama.cpp/Makefile-llama
+cd /path/to/llama.cpp
+make -f Makefile-llama build-vulkan
+make -f Makefile-llama build-rocm GPU_TARGET=gfx1201
+```
+
+Use `make -f Makefile-llama build-all` to build both backends. The Makefile
+defaults to `JOBS=12`; override it with `JOBS=N` to match the machine. Vulkan
+builds into `build-vulkan/`, while ROCm builds into `build-rocm/`.
+
+The ROCm Makefile setting `GPU_TARGET` defaults to `gfx1201`, the AMD GPU
+architecture used for this machine. Check the architecture reported by
+`rocminfo` and replace that value, either in the copied Makefile or on the make
+command line, for the GPU in your system. The correct target is the GPU's
+`gfx` architecture identifier, not its marketing name. Vulkan builds do not
+use `GPU_TARGET`.
+
+The harness defaults to the Vulkan binaries at
+`build-vulkan/bin/llama-server` and `build-vulkan/bin/llama-fit-params`. To use
+the ROCm build, add `--server ./build-rocm/bin/llama-server` and
+`--fit-binary ./build-rocm/bin/llama-fit-params` to the harness command. These
+paths are resolved relative to `--workdir`.
+
 ## Define a benchmark
 
 The harness combines setting axes as a Cartesian product. `--threads` is an

@@ -1,0 +1,561 @@
+# llama.cpp tuning Makefile
+# Target: Ryzen 9 5900X + 64 GiB DDR4 + Radeon RX 9070 XT 16 GiB (gfx1201)
+#
+# First run:
+#   make build-all
+#   make doctor
+#   make devices
+#   make bench-backends
+#
+# Daily driver:
+#   make serve-vulkan-qwen36-128k-think
+#
+# Two concurrent OpenCode threads sharing ONE 128K KV pool:
+#   make serve-vulkan-qwen36-128k-2slot-think
+#
+# Dense Qwen3.8 experiment:
+#   make serve-vulkan-qwen38-q4-128k-think
+#
+# Logging example:
+#   LOG_FILE=/tmp/llama.log LOG_VERBOSITY=4 make serve-vulkan-qwen36-q4ks-64k-q5-think
+#
+# Inspect auto-fit placement:
+#   make fit-vulkan-qwen36-q4ks-64k-q5
+#
+# "think" targets enable reasoning but deliberately do NOT set a positive
+# --reasoning-budget, so clients may vary thinking_budget_tokens per request.
+
+SHELL := /bin/bash
+SELF_MAKEFILE := $(firstword $(MAKEFILE_LIST))
+
+# ---- Build ----
+ROCM_BUILD       ?= build-rocm
+VULKAN_BUILD     ?= build-vulkan
+GPU_TARGET       ?= gfx1201
+JOBS             ?= 12
+
+ROCM_SERVER      := $(ROCM_BUILD)/bin/llama-server
+ROCM_BENCH       := $(ROCM_BUILD)/bin/llama-bench
+ROCM_FIT         := $(ROCM_BUILD)/bin/llama-fit-params
+VULKAN_SERVER    := $(VULKAN_BUILD)/bin/llama-server
+VULKAN_BENCH     := $(VULKAN_BUILD)/bin/llama-bench
+VULKAN_FIT       := $(VULKAN_BUILD)/bin/llama-fit-params
+
+# ---- Models ----
+QWEN36_IQ3       := unsloth/Qwen3.6-35B-A3B-GGUF:UD-IQ3_S
+QWEN36_Q3KS      := unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q3_K_S
+QWEN36_Q4KS      := unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_S
+QWEN38_Q4        := unsloth/Qwen3.8-27B-GGUF:UD-IQ4_XS
+
+HF               ?= $(QWEN36_IQ3)
+ALIAS            ?= qwen36-coder
+
+# ---- Runtime defaults ----
+HOST             ?= 192.168.1.122
+PORT             ?= 1234
+CTX              ?= 32768
+THREADS          ?= 12
+THREADS_BATCH    ?= $(THREADS)
+BATCH            ?= 2048
+UBATCH           ?= 512
+PARALLEL         ?= 1
+NGL              ?= auto
+NCMOE            ?= 0
+FA               ?= on
+KV_K             ?= q8_0
+KV_V             ?= q8_0
+FIT_TARGET       ?= 1024
+LOAD_MODE        ?= auto
+LAZY_MODE        ?= auto
+CACHE_REUSE      ?= 256
+
+# Qwen native template behavior. Keep old completed-turn scratchpads from
+# accumulating by default; current-turn tool-loop reasoning still depends on
+# the client round-tripping reasoning_content correctly.
+PRESERVE_THINKING ?= false
+CHAT_TEMPLATE_KWARGS := {"preserve_thinking":$(PRESERVE_THINKING)}
+
+# Qwen sampling presets
+TEMP             ?= 0.7
+TOP_P            ?= 0.8
+TOP_K            ?= 20
+THINK_TEMP       ?= 0.6
+THINK_TOP_P      ?= 0.95
+THINK_TOP_K      ?= 20
+
+# Extra runtime/debug controls.
+# These are exported so they survive every recursive preset target.
+EXTRA_SERVER_ARGS ?=
+LOG_FILE          ?=
+LOG_VERBOSITY     ?=
+ENABLE_METRICS    ?= 1
+
+export EXTRA_SERVER_ARGS
+export LOG_FILE
+export LOG_VERBOSITY
+export ENABLE_METRICS
+
+SERVER_LOG_ARGS = \
+	$(if $(strip $(LOG_FILE)),--log-file $(LOG_FILE),) \
+	$(if $(strip $(LOG_VERBOSITY)),--log-verbosity $(LOG_VERBOSITY),)
+
+SERVER_METRICS_ARGS = $(if $(filter 1 yes true on,$(ENABLE_METRICS)),--metrics,)
+
+# ---- Benchmark defaults ----
+BENCH_PROMPTS    ?= 2048,8192
+BENCH_GEN        ?= 128
+BENCH_REPS       ?= 3
+RESULTS          ?= results
+
+SERVER_BASE = \
+	-hf $(HF) \
+	--alias $(ALIAS) \
+	--host $(HOST) \
+	--port $(PORT) \
+	--jinja \
+	-c $(CTX) \
+	-np $(PARALLEL) \
+	-ngl $(NGL) \
+	-ncmoe $(NCMOE) \
+	-fit on \
+	-fitt $(FIT_TARGET) \
+	-fa $(FA) \
+	-ctk $(KV_K) \
+	-ctv $(KV_V) \
+	-b $(BATCH) \
+	-ub $(UBATCH) \
+	-t $(THREADS) \
+	-tb $(THREADS_BATCH) \
+	-lm $(LOAD_MODE) \
+	-lzm $(LAZY_MODE) \
+	--cache-reuse $(CACHE_REUSE) \
+	--no-context-shift \
+	--chat-template-kwargs '$(CHAT_TEMPLATE_KWARGS)' \
+	$(SERVER_METRICS_ARGS) \
+	$(SERVER_LOG_ARGS)
+
+SERVER_NONTHINK = \
+	--reasoning off \
+	--temp $(TEMP) \
+	--top-p $(TOP_P) \
+	--top-k $(TOP_K)
+
+SERVER_THINK = \
+	--reasoning on \
+	--temp $(THINK_TEMP) \
+	--top-p $(THINK_TOP_P) \
+	--top-k $(THINK_TOP_K)
+
+# llama-bench requires integer -ngl; -1 means maximum/all GPU layers.
+BENCH_FIXED = \
+	-hf $(HF) \
+	-p $(BENCH_PROMPTS) \
+	-n $(BENCH_GEN) \
+	-r $(BENCH_REPS) \
+	-b $(BATCH) \
+	-ngl -1 \
+	-fitt $(FIT_TARGET)
+
+BENCH_RUNTIME = \
+	-ub $(UBATCH) \
+	-t $(THREADS) \
+	-ncmoe $(NCMOE) \
+	-fa $(FA) \
+	-ctk $(KV_K) \
+	-ctv $(KV_V) \
+	-lm $(LOAD_MODE) \
+	-lzm $(LAZY_MODE)
+
+.PHONY: help \
+	build-rocm build-vulkan build-all rebuild-all clean-rocm clean-vulkan \
+	doctor devices devices-rocm devices-vulkan versions \
+	serve-rocm serve-vulkan serve-rocm-think serve-vulkan-think \
+	serve-vulkan-qwen36-32k serve-vulkan-qwen36-32k-think \
+	serve-vulkan-qwen36-64k-think \
+	serve-vulkan-qwen36-128k-q5-think \
+	serve-vulkan-qwen36-q4ks-64k-q5-think \
+	serve-vulkan-qwen36-128k serve-vulkan-qwen36-128k-think \
+	serve-vulkan-qwen36-128k-2slot-think \
+	serve-vulkan-qwen36-q3ks-128k-think \
+	serve-vulkan-qwen36-q4ks-128k-think \
+	serve-vulkan-qwen38-q4-128k serve-vulkan-qwen38-q4-128k-think \
+	bench-rocm bench-vulkan bench-backends \
+	bench-rocm-ubatch bench-vulkan-ubatch \
+	bench-rocm-fa bench-vulkan-fa \
+	bench-rocm-cpumoe bench-vulkan-cpumoe \
+	bench-rocm-threads bench-vulkan-threads \
+	bench-rocm-kv bench-vulkan-kv \
+	bench-rocm-load bench-vulkan-load \
+	fit-vulkan fit-vulkan-qwen36-iq3-128k-q5 fit-vulkan-qwen36-q4ks-64k-q5
+
+help:
+	@printf '%s\n' \
+	  'BUILD' \
+	  '  make build-all' \
+	  '  make build-rocm' \
+	  '  make build-vulkan' \
+	  '' \
+	  'CHECK' \
+	  '  make doctor' \
+	  '  make devices' \
+	  '  make versions' \
+	  '' \
+	  'BENCHMARK' \
+	  '  make bench-backends' \
+	  '  make bench-vulkan-ubatch' \
+	  '  make bench-vulkan-fa' \
+	  '  make bench-vulkan-cpumoe' \
+	  '  make bench-vulkan-threads' \
+	  '  make bench-vulkan-kv' \
+	  '' \
+	  'DAILY DRIVER' \
+	  '  make serve-vulkan-qwen36-128k-think' \
+	  '  make serve-vulkan-qwen36-128k-q5-think' \
+	  '  make serve-vulkan-qwen36-q4ks-64k-q5-think' \
+	  '' \
+	  '2 SLOTS, ONE SHARED 128K POOL' \
+	  '  make serve-vulkan-qwen36-128k-2slot-think' \
+	  '' \
+	  'DENSE QWEN3.8' \
+	  '  make serve-vulkan-qwen38-q4-128k-think' \
+	  '' \
+	  'PLACEMENT / LOGGING' \
+	  '  make fit-vulkan-qwen36-iq3-128k-q5' \
+	  '  make fit-vulkan-qwen36-q4ks-64k-q5' \
+	  '  LOG_FILE=/tmp/llama.log LOG_VERBOSITY=4 make serve-vulkan-qwen36-q4ks-64k-q5-think' \
+	  '  EXTRA_SERVER_ARGS="--some-flag value" make serve-vulkan-qwen36-128k-q5-think'
+
+# ---- Builds ----
+build-rocm:
+	@command -v hipconfig >/dev/null || { echo "hipconfig not found"; exit 1; }
+	HIPCXX="$$(hipconfig -l)/clang" HIP_PATH="$$(hipconfig -R)" \
+	cmake -S . -B $(ROCM_BUILD) \
+		-DGGML_HIP=ON \
+		-DGPU_TARGETS=$(GPU_TARGET) \
+		-DCMAKE_BUILD_TYPE=Release
+	cmake --build $(ROCM_BUILD) --config Release -- -j$(JOBS)
+
+build-vulkan:
+	cmake -S . -B $(VULKAN_BUILD) \
+		-DGGML_VULKAN=ON \
+		-DCMAKE_BUILD_TYPE=Release
+	cmake --build $(VULKAN_BUILD) --config Release -- -j$(JOBS)
+
+build-all: build-rocm build-vulkan
+
+rebuild-all:
+	cmake --build $(ROCM_BUILD) --config Release -- -j$(JOBS)
+	cmake --build $(VULKAN_BUILD) --config Release -- -j$(JOBS)
+
+clean-rocm:
+	rm -rf $(ROCM_BUILD)
+
+clean-vulkan:
+	rm -rf $(VULKAN_BUILD)
+
+# ---- Diagnostics ----
+devices-rocm:
+	$(ROCM_SERVER) --list-devices
+
+devices-vulkan:
+	$(VULKAN_SERVER) --list-devices
+
+devices: devices-rocm devices-vulkan
+
+versions:
+	@$(ROCM_SERVER) --version || true
+	@$(VULKAN_SERVER) --version || true
+
+doctor:
+	@echo "== CPU =="
+	@lscpu | grep -E 'Model name|Socket|Core|Thread|NUMA' || true
+	@echo
+	@echo "== PCIe / GPU =="
+	@lspci | grep -Ei 'VGA|Display|AMD/ATI' || true
+	@echo
+	@echo "== ROCm =="
+	@command -v hipconfig >/dev/null && hipconfig --version || echo "hipconfig: not found"
+	@command -v rocminfo >/dev/null && rocminfo | grep -E 'Name:|Marketing Name:|gfx1201' | head -40 || true
+	@command -v amd-smi >/dev/null && amd-smi static --asic --vram --bus || \
+		{ command -v rocm-smi >/dev/null && rocm-smi --showproductname --showmeminfo vram --showpids || true; }
+	@echo
+	@echo "== Vulkan =="
+	@command -v vulkaninfo >/dev/null && vulkaninfo --summary || echo "vulkaninfo: not found"
+
+# ---- Generic servers ----
+serve-rocm:
+	$(ROCM_SERVER) $(SERVER_BASE) $(SERVER_NONTHINK) $(EXTRA_SERVER_ARGS)
+
+serve-vulkan:
+	$(VULKAN_SERVER) $(SERVER_BASE) $(SERVER_NONTHINK) $(EXTRA_SERVER_ARGS)
+
+serve-rocm-think:
+	$(ROCM_SERVER) $(SERVER_BASE) $(SERVER_THINK) $(EXTRA_SERVER_ARGS)
+
+serve-vulkan-think:
+	$(VULKAN_SERVER) $(SERVER_BASE) $(SERVER_THINK) $(EXTRA_SERVER_ARGS)
+
+
+# ---- Qwen3.6 presets ----
+
+serve-vulkan-qwen36-32k:
+	$(MAKE) -f $(SELF_MAKEFILE) serve-vulkan \
+		HF=$(QWEN36_IQ3) ALIAS=qwen36-coder \
+		CTX=32768 KV_K=q8_0 KV_V=q8_0 \
+		UBATCH=512 NCMOE=0 FIT_TARGET=1024 PARALLEL=1
+
+serve-vulkan-qwen36-32k-think:
+	$(MAKE) -f $(SELF_MAKEFILE) serve-vulkan-think \
+		HF=$(QWEN36_IQ3) ALIAS=qwen36-coder \
+		CTX=32768 KV_K=q8_0 KV_V=q8_0 \
+		UBATCH=512 NCMOE=0 FIT_TARGET=1024 PARALLEL=1
+
+serve-vulkan-qwen36-64k-think:
+	$(MAKE) -f $(SELF_MAKEFILE) serve-vulkan-think \
+		HF=$(QWEN36_IQ3) ALIAS=qwen36-coder \
+		CTX=65536 KV_K=q4_0 KV_V=q4_0 \
+		UBATCH=512 NCMOE=0 FIT_TARGET=768 PARALLEL=1
+
+# Current preferred long-context compromise: IQ3_S weights + Q5_1 KV.
+serve-vulkan-qwen36-128k-q5-think:
+	$(MAKE) -f $(SELF_MAKEFILE) serve-vulkan-think \
+		HF=$(QWEN36_IQ3) ALIAS=qwen36-coder \
+		CTX=131072 KV_K=q5_1 KV_V=q5_1 \
+		UBATCH=512 NCMOE=0 FIT_TARGET=768 PARALLEL=1
+
+# Higher model fidelity profile currently under test: Q4_K_S + 64K + Q5_1 KV.
+serve-vulkan-qwen36-q4ks-64k-q5-think:
+	$(MAKE) -f $(SELF_MAKEFILE) serve-vulkan-think \
+		HF=$(QWEN36_Q4KS) ALIAS=qwen36-q4ks \
+		CTX=65536 KV_K=q5_1 KV_V=q5_1 \
+		UBATCH=256 NCMOE=0 FIT_TARGET=768 PARALLEL=1
+
+# Main one-slot 128K configuration from the thread.
+serve-vulkan-qwen36-128k:
+	$(MAKE) -f $(SELF_MAKEFILE) serve-vulkan \
+		HF=$(QWEN36_IQ3) ALIAS=qwen36-coder \
+		CTX=131072 KV_K=q4_0 KV_V=q4_0 \
+		UBATCH=512 NCMOE=0 FIT_TARGET=768 PARALLEL=1
+
+serve-vulkan-qwen36-128k-think:
+	$(MAKE) -f $(SELF_MAKEFILE) serve-vulkan-think \
+		HF=$(QWEN36_IQ3) ALIAS=qwen36-coder \
+		CTX=131072 KV_K=q4_0 KV_V=q4_0 \
+		UBATCH=512 NCMOE=0 FIT_TARGET=768 PARALLEL=1
+
+# Two execution slots sharing ONE 128K unified KV pool:
+#   total pool       = 131072
+#   per-slot ceiling = 131072
+# One slot may use nearly the whole pool when alone. Two may run concurrently
+# while their combined live KV fits the 128K pool.
+#
+# CACHE_REUSE=0 is intentional for this mode; prompt caching itself remains on.
+serve-vulkan-qwen36-128k-2slot-think:
+	$(MAKE) -f $(SELF_MAKEFILE) serve-vulkan-think \
+		HF=$(QWEN36_IQ3) ALIAS=qwen36-coder \
+		CTX=131072 KV_K=q4_0 KV_V=q4_0 \
+		UBATCH=512 NCMOE=0 FIT_TARGET=768 \
+		PARALLEL=2 CACHE_REUSE=0 \
+		EXTRA_SERVER_ARGS="--kv-unified --kv-unified-per-slot 131072"
+
+# Higher-fidelity Qwen3.6 quant experiments. These are much tighter on 16 GiB;
+# --fit may spill weights. Start with ubatch 256 to reduce transient VRAM use.
+serve-vulkan-qwen36-q3ks-128k-think:
+	$(MAKE) -f $(SELF_MAKEFILE) serve-vulkan-think \
+		HF=$(QWEN36_Q3KS) ALIAS=qwen36-q3ks \
+		CTX=131072 KV_K=q4_0 KV_V=q4_0 \
+		UBATCH=256 NCMOE=0 FIT_TARGET=768 PARALLEL=1
+
+serve-vulkan-qwen36-q4ks-128k-think:
+	$(MAKE) -f $(SELF_MAKEFILE) serve-vulkan-think \
+		HF=$(QWEN36_Q4KS) ALIAS=qwen36-q4ks \
+		CTX=131072 KV_K=q4_0 KV_V=q4_0 \
+		UBATCH=256 NCMOE=0 FIT_TARGET=768 PARALLEL=1
+
+# ---- Qwen3.8 dense preset ----
+# Dense: no MoE expert offload. UD-IQ4_XS is ~14.3 GB.
+# Try UBATCH=512 after confirming 256 is stable and leaves VRAM headroom.
+
+serve-vulkan-qwen38-q4-128k:
+	$(MAKE) -f $(SELF_MAKEFILE) serve-vulkan \
+		HF=$(QWEN38_Q4) ALIAS=qwen38-coder \
+		CTX=131072 KV_K=q4_0 KV_V=q4_0 \
+		UBATCH=256 NCMOE=0 FIT_TARGET=768 PARALLEL=1
+
+serve-vulkan-qwen38-q4-128k-think:
+	$(MAKE) -f $(SELF_MAKEFILE) serve-vulkan-think \
+		HF=$(QWEN38_Q4) ALIAS=qwen38-coder \
+		CTX=131072 KV_K=q4_0 KV_V=q4_0 \
+		UBATCH=256 NCMOE=0 FIT_TARGET=768 PARALLEL=1
+
+
+# ---- Placement / auto-fit inspection -------------------------------------
+# llama-fit-params prints the placement parameters chosen to fit the requested
+# context/cache/compute configuration into the available device memory.
+#
+# Override HF/CTX/KV_K/KV_V/UBATCH/FIT_TARGET for arbitrary experiments.
+
+fit-vulkan:
+	@command -v $(VULKAN_FIT) >/dev/null 2>&1 || { \
+		echo "$(VULKAN_FIT) not found; rebuild current llama.cpp with make build-vulkan"; \
+		exit 1; \
+	}
+	$(VULKAN_FIT) \
+		-hf $(HF) \
+		-c $(CTX) \
+		-ctk $(KV_K) \
+		-ctv $(KV_V) \
+		-b $(BATCH) \
+		-ub $(UBATCH) \
+		-fa $(FA) \
+		-fitt $(FIT_TARGET)
+
+fit-vulkan-qwen36-iq3-128k-q5:
+	$(MAKE) -f $(SELF_MAKEFILE) fit-vulkan \
+		HF=$(QWEN36_IQ3) \
+		CTX=131072 KV_K=q5_1 KV_V=q5_1 \
+		UBATCH=512 FIT_TARGET=768
+
+fit-vulkan-qwen36-q4ks-64k-q5:
+	$(MAKE) -f $(SELF_MAKEFILE) fit-vulkan \
+		HF=$(QWEN36_Q4KS) \
+		CTX=65536 KV_K=q5_1 KV_V=q5_1 \
+		UBATCH=256 FIT_TARGET=768
+
+
+# ---- Benchmark output dir ----
+$(RESULTS):
+	mkdir -p $(RESULTS)
+
+# ---- Baseline backend comparison ----
+bench-rocm: | $(RESULTS)
+	$(ROCM_BENCH) $(BENCH_FIXED) $(BENCH_RUNTIME) -o md \
+		| tee $(RESULTS)/rocm-baseline.md
+
+bench-vulkan: | $(RESULTS)
+	$(VULKAN_BENCH) $(BENCH_FIXED) $(BENCH_RUNTIME) -o md \
+		| tee $(RESULTS)/vulkan-baseline.md
+
+bench-backends: bench-rocm bench-vulkan
+	@echo
+	@echo "Compare:"
+	@echo "  $(RESULTS)/rocm-baseline.md"
+	@echo "  $(RESULTS)/vulkan-baseline.md"
+
+# ---- ubatch: prompt/prefill throughput vs transient VRAM ----
+bench-rocm-ubatch: | $(RESULTS)
+	$(ROCM_BENCH) $(BENCH_FIXED) \
+		-ub 256,512,1024,2048 \
+		-t $(THREADS) -ncmoe $(NCMOE) -fa $(FA) \
+		-ctk $(KV_K) -ctv $(KV_V) \
+		-lm $(LOAD_MODE) -lzm $(LAZY_MODE) \
+		-o md | tee $(RESULTS)/rocm-ubatch.md
+
+bench-vulkan-ubatch: | $(RESULTS)
+	$(VULKAN_BENCH) $(BENCH_FIXED) \
+		-ub 256,512,1024,2048 \
+		-t $(THREADS) -ncmoe $(NCMOE) -fa $(FA) \
+		-ctk $(KV_K) -ctv $(KV_V) \
+		-lm $(LOAD_MODE) -lzm $(LAZY_MODE) \
+		-o md | tee $(RESULTS)/vulkan-ubatch.md
+
+# ---- FlashAttention ----
+bench-rocm-fa: | $(RESULTS)
+	$(ROCM_BENCH) $(BENCH_FIXED) \
+		-ub $(UBATCH) -t $(THREADS) -ncmoe $(NCMOE) \
+		-fa on,off,auto \
+		-ctk $(KV_K) -ctv $(KV_V) \
+		-lm $(LOAD_MODE) -lzm $(LAZY_MODE) \
+		-o md | tee $(RESULTS)/rocm-fa.md
+
+bench-vulkan-fa: | $(RESULTS)
+	$(VULKAN_BENCH) $(BENCH_FIXED) \
+		-ub $(UBATCH) -t $(THREADS) -ncmoe $(NCMOE) \
+		-fa on,off,auto \
+		-ctk $(KV_K) -ctv $(KV_V) \
+		-lm $(LOAD_MODE) -lzm $(LAZY_MODE) \
+		-o md | tee $(RESULTS)/vulkan-fa.md
+
+# ---- MoE placement ----
+# Relevant to Qwen3.6. CPU-MoE saves VRAM but usually hurts decode throughput.
+bench-rocm-cpumoe: | $(RESULTS)
+	$(ROCM_BENCH) $(BENCH_FIXED) \
+		-ub $(UBATCH) -t $(THREADS) \
+		-ncmoe 0,4,8,12,16 \
+		-fa $(FA) -ctk $(KV_K) -ctv $(KV_V) \
+		-lm $(LOAD_MODE) -lzm $(LAZY_MODE) \
+		-o md | tee $(RESULTS)/rocm-cpumoe.md
+
+bench-vulkan-cpumoe: | $(RESULTS)
+	$(VULKAN_BENCH) $(BENCH_FIXED) \
+		-ub $(UBATCH) -t $(THREADS) \
+		-ncmoe 0,4,8,12,16 \
+		-fa $(FA) -ctk $(KV_K) -ctv $(KV_V) \
+		-lm $(LOAD_MODE) -lzm $(LAZY_MODE) \
+		-o md | tee $(RESULTS)/vulkan-cpumoe.md
+
+
+# ---- CPU thread sweep ----
+# 5900X = 12C/24T. Hybrid inference can saturate memory bandwidth before SMT helps.
+bench-rocm-threads: | $(RESULTS)
+	$(ROCM_BENCH) $(BENCH_FIXED) \
+		-ub $(UBATCH) -t 8,12,16,24 \
+		-ncmoe $(NCMOE) -fa $(FA) \
+		-ctk $(KV_K) -ctv $(KV_V) \
+		-lm $(LOAD_MODE) -lzm $(LAZY_MODE) \
+		-o md | tee $(RESULTS)/rocm-threads.md
+
+bench-vulkan-threads: | $(RESULTS)
+	$(VULKAN_BENCH) $(BENCH_FIXED) \
+		-ub $(UBATCH) -t 8,12,16,24 \
+		-ncmoe $(NCMOE) -fa $(FA) \
+		-ctk $(KV_K) -ctv $(KV_V) \
+		-lm $(LOAD_MODE) -lzm $(LAZY_MODE) \
+		-o md | tee $(RESULTS)/vulkan-threads.md
+
+# ---- KV cache quantization ----
+# Q4 is the long-context preset; Q8 is a useful quality/control run.
+bench-rocm-kv: | $(RESULTS)
+	$(ROCM_BENCH) $(BENCH_FIXED) \
+		-ub $(UBATCH) -t $(THREADS) -ncmoe $(NCMOE) -fa $(FA) \
+		-ctk q8_0 -ctv q8_0 -lm $(LOAD_MODE) -lzm $(LAZY_MODE) \
+		-o md | tee $(RESULTS)/rocm-kv-q8.md
+	$(ROCM_BENCH) $(BENCH_FIXED) \
+		-ub $(UBATCH) -t $(THREADS) -ncmoe $(NCMOE) -fa $(FA) \
+		-ctk q4_0 -ctv q4_0 -lm $(LOAD_MODE) -lzm $(LAZY_MODE) \
+		-o md | tee $(RESULTS)/rocm-kv-q4.md
+
+bench-vulkan-kv: | $(RESULTS)
+	$(VULKAN_BENCH) $(BENCH_FIXED) \
+		-ub $(UBATCH) -t $(THREADS) -ncmoe $(NCMOE) -fa $(FA) \
+		-ctk q8_0 -ctv q8_0 -lm $(LOAD_MODE) -lzm $(LAZY_MODE) \
+		-o md | tee $(RESULTS)/vulkan-kv-q8.md
+	$(VULKAN_BENCH) $(BENCH_FIXED) \
+		-ub $(UBATCH) -t $(THREADS) -ncmoe $(NCMOE) -fa $(FA) \
+		-ctk q4_0 -ctv q4_0 -lm $(LOAD_MODE) -lzm $(LAZY_MODE) \
+		-o md | tee $(RESULTS)/vulkan-kv-q4.md
+
+# ---- Storage/load experiments ----
+# These primarily affect cold load/page-cache behavior. They are not a substitute
+# for keeping hot inference weights in VRAM/RAM. RPC/RDMA is for remote backends,
+# not local NVMe->GPU weight streaming.
+
+bench-rocm-load: | $(RESULTS)
+	$(ROCM_BENCH) $(BENCH_FIXED) \
+		-ub $(UBATCH) -t $(THREADS) -ncmoe $(NCMOE) -fa $(FA) \
+		-ctk $(KV_K) -ctv $(KV_V) -lm mmap -lzm auto \
+		-o md | tee $(RESULTS)/rocm-load-mmap.md
+	$(ROCM_BENCH) $(BENCH_FIXED) \
+		-ub $(UBATCH) -t $(THREADS) -ncmoe $(NCMOE) -fa $(FA) \
+		-ctk $(KV_K) -ctv $(KV_V) -lm dio -lzm auto \
+		-o md | tee $(RESULTS)/rocm-load-dio.md
+
+bench-vulkan-load: | $(RESULTS)
+	$(VULKAN_BENCH) $(BENCH_FIXED) \
+		-ub $(UBATCH) -t $(THREADS) -ncmoe $(NCMOE) -fa $(FA) \
+		-ctk $(KV_K) -ctv $(KV_V) -lm mmap -lzm auto \
+		-o md | tee $(RESULTS)/vulkan-load-mmap.md
+	$(VULKAN_BENCH) $(BENCH_FIXED) \
+		-ub $(UBATCH) -t $(THREADS) -ncmoe $(NCMOE) -fa $(FA) \
+		-ctk $(KV_K) -ctv $(KV_V) -lm dio -lzm auto \
+		-o md | tee $(RESULTS)/vulkan-load-dio.md
