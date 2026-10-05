@@ -1,0 +1,18 @@
+[Unit]
+Description=llama.cpp Qwen3.6 35B IQ4_XS Vulkan server
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+WorkingDirectory=%h/sources/llama.cpp
+Environment=GGML_VK_VISIBLE_DEVICES=0
+ExecStart=%h/sources/llama.cpp/build-vulkan/bin/llama-server -hf unsloth/Qwen3.6-35B-A3B-GGUF:UD-IQ4_XS --alias qwen36-iq4-xs --host 192.168.1.122 --port 1234 --jinja -c 131072 -np 2 -ngl auto -ncmoe 0 -fit on -fitt 256 -fa on -ctk q5_1 -ctv q5_1 -b 512 -ub 512 -t 8 -tb 8 -lm auto -lzm auto --cache-reuse 0 --no-context-shift --kv-unified --kv-unified-per-slot 131072 --chat-template-kwargs "{\"preserve_thinking\":false}" --metrics --reasoning on --temp 0.6 --top-p 0.95 --top-k 20
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=45s
+
+[Install]
+WantedBy=default.target

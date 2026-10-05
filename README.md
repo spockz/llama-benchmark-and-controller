@@ -49,6 +49,43 @@ the ROCm build, add `--server ./build-rocm/bin/llama-server` and
 `--fit-binary ./build-rocm/bin/llama-fit-params` to the harness command. These
 paths are resolved relative to `--workdir`.
 
+## Run Qwen3.6 IQ4_XS as a systemd user service
+
+[`systemd/llama-qwen36-iq4-xs.service`](systemd/llama-qwen36-iq4-xs.service)
+defines a Vulkan server on port 1234 using the Qwen3.6-35B-A3B `UD-IQ4_XS`
+model. It uses the measured 8-thread / batch-512 / parallel-2 settings, with a
+128K unified KV pool shared by the two slots, Q5_1 K/V cache, ubatch 512, fit
+target 256 MiB, and preserve-thinking disabled. The earlier 80.6 s result was
+measured before the IQ4_NL vs IQ4_XS full-grid run, so this is a recommended
+starting configuration rather than a confirmed winner for that exact model
+and context combination.
+
+The unit expects the llama.cpp checkout and Vulkan build at
+`~/sources/llama.cpp`. Copy the unit into your user systemd directory and
+enable it:
+
+```sh
+install -Dm644 systemd/llama-qwen36-iq4-xs.service \
+  "$HOME/.config/systemd/user/llama-qwen36-iq4-xs.service"
+systemctl --user daemon-reload
+systemctl --user enable --now llama-qwen36-iq4-xs.service
+```
+
+After editing the unit, copy it again, then reload and restart it:
+
+```sh
+systemctl --user daemon-reload
+systemctl --user reset-failed llama-qwen36-iq4-xs.service
+systemctl --user restart llama-qwen36-iq4-xs.service
+```
+
+Check it with `systemctl --user status llama-qwen36-iq4-xs.service` and follow
+its log with `journalctl --user -u llama-qwen36-iq4-xs.service -f`. The unit
+binds to `192.168.1.122`; change `--host` in the unit if this machine's LAN
+address differs. If the service should keep running after logout and start at
+boot without a logged-in session, enable user lingering with
+`loginctl enable-linger "$USER"`.
+
 ## Define a benchmark
 
 The harness combines setting axes as a Cartesian product. `--threads` is an
@@ -81,6 +118,19 @@ Unified KV, a 204,800 token per-slot limit, cache reuse 0, FlashAttention on,
 and preserve-thinking off are also fixed. The matrix has 108 model/configuration/
 thread cells. See [the matrix manifest](benchmark-runs/iq4-nl-vs-xs-full-grid-20260929/matrix.json)
 and [its launcher](benchmark-runs/iq4-nl-vs-xs-full-grid-20260929/run.sh).
+
+## Machine and fastest measured setup
+
+The benchmark workstation has an AMD Ryzen 9 5900X (12 cores / 24 threads),
+64 GiB dual-channel DDR4-4000, and an AMD Radeon RX 9070 XT with 16 GiB VRAM
+(RDNA4, `gfx1201`).
+
+The fastest completed end-to-end setup recorded so far used parallelism 2,
+batch 512, 8 CPU threads, and preserve-thinking off. Its median task wall time
+was 80.6 s, with 47.1 tok/s whole-server generation rate, 46.9 tok/s weighted
+task decode rate, and 96,602 median client prompt tokens. This is an earlier
+measured result, not the winner of the IQ4_NL vs IQ4_XS full-grid matrix above;
+use that matrix's completed analysis to identify its winner.
 
 For a complete factorial matrix, list all values directly on the harness
 command line. Each combination of model, context, parallelism, batch, and other
