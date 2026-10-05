@@ -90,18 +90,24 @@ func generatePairwisePlan(manifest analysisMatrixManifest) ([]coverageCell, erro
 	if err != nil {
 		return nil, err
 	}
-	type candidate struct {
-		cell   coverageCell
-		values []string
-	}
-	candidates := []candidate{{values: make([]string, len(factors))}}
+	candidates := buildPairwiseCandidates(factors)
+	return selectPairwiseCells(candidates, factors)
+}
+
+type pairwiseCandidate struct {
+	cell   coverageCell
+	values []string
+}
+
+func buildPairwiseCandidates(factors []coverageFactor) []pairwiseCandidate {
+	candidates := []pairwiseCandidate{{values: make([]string, len(factors))}}
 	for i, factor := range factors {
-		next := make([]candidate, 0, len(candidates)*len(factor.values))
+		next := make([]pairwiseCandidate, 0, len(candidates)*len(factor.values))
 		for _, partial := range candidates {
 			for _, value := range factor.values {
 				copyValues := append([]string(nil), partial.values...)
 				copyValues[i] = value
-				candidate := candidate{cell: partial.cell, values: copyValues}
+				candidate := pairwiseCandidate{cell: partial.cell, values: copyValues}
 				if factor.name == "threads" {
 					candidate.cell.Threads, _ = strconv.Atoi(value)
 				} else {
@@ -112,53 +118,77 @@ func generatePairwisePlan(manifest analysisMatrixManifest) ([]coverageCell, erro
 		}
 		candidates = next
 	}
+	return candidates
+}
 
-	pairs := make(map[string]bool)
-	for _, candidate := range candidates {
-		for i := 0; i < len(factors); i++ {
-			for j := i + 1; j < len(factors); j++ {
-				pairs[pairKey(i, candidate.values[i], j, candidate.values[j])] = true
-			}
-		}
-	}
+func selectPairwiseCells(candidates []pairwiseCandidate, factors []coverageFactor) ([]coverageCell, error) {
+	pairs := allPairwiseKeys(candidates, len(factors))
 	remaining := len(pairs)
 	selected := make([]bool, len(candidates))
 	var plan []coverageCell
 	for remaining > 0 {
-		bestIndex, bestScore := -1, 0
-		for i, candidate := range candidates {
-			if selected[i] {
-				continue
-			}
-			score := 0
-			for a := 0; a < len(factors); a++ {
-				for b := a + 1; b < len(factors); b++ {
-					if pairs[pairKey(a, candidate.values[a], b, candidate.values[b])] {
-						score++
-					}
-				}
-			}
-			if score > bestScore {
-				bestIndex, bestScore = i, score
-			}
-		}
+		bestIndex := highestScoringCandidate(candidates, factors, selected, pairs)
 		if bestIndex < 0 {
 			return nil, errors.New("pairwise planner could not cover all factor pairs")
 		}
 		selected[bestIndex] = true
 		best := candidates[bestIndex]
 		plan = append(plan, best.cell)
-		for a := 0; a < len(factors); a++ {
-			for b := a + 1; b < len(factors); b++ {
-				key := pairKey(a, best.values[a], b, best.values[b])
-				if pairs[key] {
-					delete(pairs, key)
-					remaining--
-				}
+		remaining -= removeCoveredPairs(pairs, best.values, len(factors))
+	}
+	return plan, nil
+}
+
+func allPairwiseKeys(candidates []pairwiseCandidate, factorCount int) map[string]bool {
+	pairs := make(map[string]bool)
+	for _, candidate := range candidates {
+		for i := 0; i < factorCount; i++ {
+			for j := i + 1; j < factorCount; j++ {
+				pairs[pairKey(i, candidate.values[i], j, candidate.values[j])] = true
 			}
 		}
 	}
-	return plan, nil
+	return pairs
+}
+
+func highestScoringCandidate(candidates []pairwiseCandidate, factors []coverageFactor, selected []bool, pairs map[string]bool) int {
+	bestIndex, bestScore := -1, 0
+	for i, candidate := range candidates {
+		if selected[i] {
+			continue
+		}
+		score := candidatePairScore(candidate.values, len(factors), pairs)
+		if score > bestScore {
+			bestIndex, bestScore = i, score
+		}
+	}
+	return bestIndex
+}
+
+func candidatePairScore(values []string, factorCount int, pairs map[string]bool) int {
+	score := 0
+	for a := 0; a < factorCount; a++ {
+		for b := a + 1; b < factorCount; b++ {
+			if pairs[pairKey(a, values[a], b, values[b])] {
+				score++
+			}
+		}
+	}
+	return score
+}
+
+func removeCoveredPairs(pairs map[string]bool, values []string, factorCount int) int {
+	removed := 0
+	for a := 0; a < factorCount; a++ {
+		for b := a + 1; b < factorCount; b++ {
+			key := pairKey(a, values[a], b, values[b])
+			if pairs[key] {
+				delete(pairs, key)
+				removed++
+			}
+		}
+	}
+	return removed
 }
 
 func pairKey(a int, av string, b int, bv string) string {

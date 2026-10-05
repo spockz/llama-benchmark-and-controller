@@ -32,6 +32,9 @@ make -f Makefile-llama build-vulkan
 make -f Makefile-llama build-rocm GPU_TARGET=gfx1201
 ```
 
+Server targets ask which host/IP to bind to when run interactively. For
+non-interactive use, pass `HOST="<your-ip>"` explicitly.
+
 Use `make -f Makefile-llama build-all` to build both backends. The Makefile
 defaults to `JOBS=12`; override it with `JOBS=N` to match the machine. Vulkan
 builds into `build-vulkan/`, while ROCm builds into `build-rocm/`.
@@ -49,42 +52,107 @@ the ROCm build, add `--server ./build-rocm/bin/llama-server` and
 `--fit-binary ./build-rocm/bin/llama-fit-params` to the harness command. These
 paths are resolved relative to `--workdir`.
 
-## Run Qwen3.6 IQ4_XS as a systemd user service
+## Host and switch between the two models
 
-[`systemd/llama-qwen36-iq4-xs.service`](systemd/llama-qwen36-iq4-xs.service)
-defines a Vulkan server on port 1234 using the Qwen3.6-35B-A3B `UD-IQ4_XS`
-model. It uses the measured 8-thread / batch-512 / parallel-2 settings, with a
-128K unified KV pool shared by the two slots, Q5_1 K/V cache, ubatch 512, fit
-target 256 MiB, and preserve-thinking disabled. The earlier 80.6 s result was
-measured before the IQ4_NL vs IQ4_XS full-grid run, so this is a recommended
-starting configuration rather than a confirmed winner for that exact model
-and context combination.
+The router service keeps one `llama-server` process on port 1234 and loads at
+most one model at a time. The example presets configure Qwen3.6-35B-A3B
+`UD-Q3_K_M` and `UD-IQ4_XS` at 128K context. The Q3 preset uses its existing
+candidate settings (6 threads, batch 2048, ubatch 256, fit target 512 MiB,
+Q5_1 K/V); the IQ4_XS preset uses 8 threads, batch/ubatch 512 and fit target
+256 MiB. `n-gpu-layers = auto` and `fit = on` let the installed build place as
+much as it can on the GPU. The Q3_K_M fit was only measured at 64K and spilled
+some expert tensors to CPU RAM even there. At 128K it may spill more, so this
+is a requested 128K configuration, not a verified all-GPU fit or a measured
+performance result. Check the server log after startup; do not run fitting
+while another model is using the GPU.
 
-The unit expects the llama.cpp checkout and Vulkan build at
-`~/sources/llama.cpp`. Copy the unit into your user systemd directory and
-enable it:
-
-```sh
-install -Dm644 systemd/llama-qwen36-iq4-xs.service \
-  "$HOME/.config/systemd/user/llama-qwen36-iq4-xs.service"
-systemctl --user daemon-reload
-systemctl --user enable --now llama-qwen36-iq4-xs.service
-```
-
-After editing the unit, copy it again, then reload and restart it:
+Copy [`models.ini.example`](models.ini.example) to
+`~/.config/llama-modelctl/models.ini`. Replace `USER` in both
+`slot-save-path` values with the account running llama-server, then create the
+directories. Slot files live on the server host and must remain accessible to
+llama-server:
 
 ```sh
-systemctl --user daemon-reload
-systemctl --user reset-failed llama-qwen36-iq4-xs.service
-systemctl --user restart llama-qwen36-iq4-xs.service
+install -Dm600 models.ini.example "$HOME/.config/llama-modelctl/models.ini"
+mkdir -p "$HOME/.local/share/llama-modelctl/slots/q3-k-m" \
+  "$HOME/.local/share/llama-modelctl/slots/iq4-xs"
 ```
 
-Check it with `systemctl --user status llama-qwen36-iq4-xs.service` and follow
-its log with `journalctl --user -u llama-qwen36-iq4-xs.service -f`. The unit
-binds to `192.168.1.122`; change `--host` in the unit if this machine's LAN
-address differs. If the service should keep running after logout and start at
-boot without a logged-in session, enable user lingering with
-`loginctl enable-linger "$USER"`.
+Edit the two named sections to use local `model = /path/to/model.gguf` values
+or a supported `hf = repository:quantization` source. Model IDs are the INI
+section names (`qwen36-q3-k-m` and `qwen36-iq4-xs`). Tune each section
+independently. Keep a trailing slash on each `slot-save-path`.
+
+Install the router unit from [`systemd/llama-model-router.service`](systemd/llama-model-router.service),
+adjust its llama.cpp path and GPU identifier for the serving machine, then set
+the bind address in a server environment file and enable it:
+
+```sh
+install -Dm644 systemd/llama-model-router.service \
+  "$HOME/.config/systemd/user/llama-model-router.service"
+install -Dm600 systemd/server.env.example \
+  "$HOME/.config/llama-modelctl/server.env"
+systemctl --user daemon-reload
+systemctl --user enable --now llama-model-router.service
+systemctl --user status llama-model-router.service
+```
+
+Edit `~/.config/llama-modelctl/server.env` and set `LLAMA_SERVER_HOST` to
+`<your-ip>` before starting the service.
+
+The unit assumes the Vulkan build at `~/sources/llama.cpp` and GPU device 0.
+For boot without an interactive login, enable user lingering with
+`loginctl enable-linger "$USER"`. Do not run the older single-model unit on
+port 1234 at the same time. Protect the management API with a trusted
+network/firewall or SSH tunnel. If llama-server is configured with an API key,
+pass that key to the controller as `--token` or `LLAMA_SERVER_TOKEN`.
+
+Build the companion controller with `make build-modelctl` (or `make build`);
+it produces `bin/llama-modelctl`. It only uses Go's standard library and can be
+built for another machine with that machine's Go toolchain. To install the
+latest version directly from GitHub, install Go and run:
+
+```sh
+go install github.com/spockz/llama-benchmark-and-controller/cmd/llama-modelctl@latest
+```
+
+This places `llama-modelctl` in `$(go env GOPATH)/bin` (often `$HOME/go/bin`);
+add that directory to `PATH` if needed. Then use the installed command as in
+these examples:
+
+```sh
+llama-modelctl --host "<your-ip>" --port 1234 --preset ./models.ini status
+llama-modelctl --server "http://<your-ip>:1234" --preset ./models.ini load qwen36-q3-k-m
+llama-modelctl --host "<your-ip>" --preset ./models.ini switch qwen36-iq4-xs
+llama-modelctl --host "<your-ip>" --preset ./models.ini config qwen36-iq4-xs
+llama-modelctl --host "<your-ip>" --preset ./models.ini save
+llama-modelctl --host "<your-ip>" --preset ./models.ini unload
+```
+
+`unload` is the blanket GPU-release command: it saves each active model's cache,
+waits for slot 0 to become idle, unloads every loaded or sleeping router model,
+and verifies that none remain. For example, run
+`llama-modelctl --host "<your-ip>" unload` before using the GPU for another
+task. `switch` and `unload` recheck slot 0 before unloading and wait for each
+transition. Pause new inference submissions while switching; the server API has no
+atomic lock shared with ordinary generation requests. A failed save stops the
+operation; `--discard-cache` is an explicit override. `switch`
+restores a cache only when the manifest matches model identity/hash, adapter,
+context/RoPE, K/V types, full preset settings and llama.cpp build. For models
+whose files are only on the server, give the controller a trusted digest with
+`--model-sha256 model-id=HEX` or use an HF snapshot revision it can identify;
+uncertain caches are saved but never restored. Use `--session` to keep
+independent conversations' slot files separate.
+
+The controller keeps manifests and its exclusive lock in `--state-dir`. For
+multiple remote clients to coordinate, point them all at the same shared state
+directory with working file locks. Otherwise run the controller on the server
+host (for example over SSH), where its default lock is shared by invocations.
+Keep the cache manifest directory available to whichever client performs a
+later restore. The slot cache only speeds up matching-prefix evaluation:
+inference clients must continue sending full prompt/history, set `id_slot: 0`,
+and enable prompt reuse. `--cache-ram` is an in-memory cache and does not
+survive model process unloads.
 
 ## Define a benchmark
 

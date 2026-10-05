@@ -5,13 +5,14 @@ GO ?= go
 GOLANGCI_LINT ?= golangci-lint
 BIN_DIR ?= bin
 BINARY := $(BIN_DIR)/llama-bench-harness
+MODELCTL := $(BIN_DIR)/llama-modelctl
 GO_STATE := .scratch/go
 export GOCACHE := $(CURDIR)/$(GO_STATE)/build
 export GOMODCACHE := $(CURDIR)/$(GO_STATE)/mod
 export GOTMPDIR := $(CURDIR)/$(GO_STATE)/tmp
 export GOPATH := $(CURDIR)/$(GO_STATE)
 
-.PHONY: all go-env build test vet lint fmt clean help
+.PHONY: all go-env build build-modelctl test vet lint fmt clean help
 
 all: build
 
@@ -21,6 +22,11 @@ go-env:
 build: go-env ## Build the llama.cpp benchmark harness
 	@mkdir -p "$(BIN_DIR)"
 	$(GO) build -buildvcs=false -o "$(BINARY)" .
+	$(GO) build -buildvcs=false -o "$(MODELCTL)" ./cmd/llama-modelctl
+
+build-modelctl: go-env ## Build the remote llama.cpp model controller CLI
+	@mkdir -p "$(BIN_DIR)"
+	$(GO) build -buildvcs=false -o "$(MODELCTL)" ./cmd/llama-modelctl
 
 test: go-env ## Run Go tests
 	$(GO) test ./...

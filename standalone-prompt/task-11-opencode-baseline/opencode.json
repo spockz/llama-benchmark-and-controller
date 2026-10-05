@@ -5,7 +5,7 @@
       "name": "AMD Beast",
       "npm": "@ai-sdk/openai-compatible",
       "options": {
-        "baseURL": "http://192.168.1.122:1234/v1"
+        "baseURL": "http://<your-ip>:1234/v1"
       },
       "models": {
         "qwen36-coder": {

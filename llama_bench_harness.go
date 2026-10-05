@@ -120,6 +120,12 @@ type experiment struct {
 	Threads []int
 }
 
+type experimentAxis struct {
+	name   string
+	values []string
+	apply  func(*config, string) error
+}
+
 func startManaged(cmd *exec.Cmd) (*managedProc, error) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
@@ -372,26 +378,49 @@ var (
 )
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "analyze" {
-		if err := runAnalysisCommand(os.Args[2:], os.Stdout); err != nil {
-			fatalf("analyze: %v", err)
-		}
+	if runAuxiliaryCommand(os.Args[1:]) {
 		return
 	}
-	if len(os.Args) > 1 && os.Args[1] == "plan" {
-		if err := runPlanCommand(os.Args[2:], os.Stdout); err != nil {
-			fatalf("plan: %v", err)
-		}
+	cfg, threadValues := prepareBenchmarkConfig(parseFlags())
+	writeEnvironmentSnapshot(cfg)
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	experiments, results := loadBenchmarkState(cfg, threadValues)
+	fitByConfig, fitSpillByConfig := inspectExperimentFits(ctx, cfg, experiments)
+	interrupted := runExperimentMatrix(ctx, cfg, threadValues, experiments, fitByConfig, fitSpillByConfig, &results)
+	if interrupted {
 		return
 	}
+	fmt.Println()
+	printAggregateSummary(results)
+	fmt.Printf("\nResults: %s\n", cfg.OutputDir)
+}
 
-	cfg := parseFlags()
+func runAuxiliaryCommand(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	var err error
+	switch args[0] {
+	case "analyze":
+		err = runAnalysisCommand(args[1:], os.Stdout)
+	case "plan":
+		err = runPlanCommand(args[1:], os.Stdout)
+	default:
+		return false
+	}
+	if err != nil {
+		fatalf("%s: %v", args[0], err)
+	}
+	return true
+}
+
+func prepareBenchmarkConfig(cfg config) (config, []int) {
 	invocationDir, err := os.Getwd()
 	if err != nil {
 		fatalf("current directory: %v", err)
 	}
-
-	threadValues, err := parseThreadValues(cfg.ThreadValues)
+	threads, err := parseThreadValues(cfg.ThreadValues)
 	if err != nil {
 		fatalf("invalid --threads: %v", err)
 	}
@@ -401,7 +430,14 @@ func main() {
 	if cfg.WarmupRuns < 0 {
 		fatalf("--warmup-runs must be >= 0")
 	}
+	cfg = resolveBenchmarkPaths(cfg, invocationDir)
+	cfg = resolveProfilerTools(cfg)
+	cfg = setupMemoryProfiler(cfg)
+	return cfg, threads
+}
 
+func resolveBenchmarkPaths(cfg config, invocationDir string) config {
+	var err error
 	if cfg.ClientCmd == "" {
 		promptScript, resolveErr := resolveFile(cfg.PromptScript, invocationDir)
 		if resolveErr != nil {
@@ -424,11 +460,21 @@ func main() {
 	if err := os.MkdirAll(cfg.OutputDir, 0o755); err != nil {
 		fatalf("create output dir: %v", err)
 	}
+	cfg.ServerBinary = resolveRequiredExecutable(cfg.ServerBinary, cfg.WorkDir, "server binary")
+	cfg.Shell = resolveRequiredExecutable(cfg.Shell, cfg.WorkDir, "shell")
+	return cfg
+}
 
-	cfg.ServerBinary, err = resolveExecutable(cfg.ServerBinary, cfg.WorkDir)
+func resolveRequiredExecutable(path, workDir, label string) string {
+	resolved, err := resolveExecutable(path, workDir)
 	if err != nil {
-		fatalf("server binary: %v", err)
+		fatalf("%s: %v", label, err)
 	}
+	return resolved
+}
+
+func resolveProfilerTools(cfg config) config {
+	var err error
 	if cfg.InspectFit {
 		cfg.FitBinary, err = resolveExecutable(cfg.FitBinary, cfg.WorkDir)
 		if err != nil {
@@ -450,151 +496,191 @@ func main() {
 			cfg.ProfileMemory = false
 		}
 	}
-	cfg.Shell, err = resolveExecutable(cfg.Shell, cfg.WorkDir)
-	if err != nil {
-		fatalf("shell: %v", err)
-	}
+	return cfg
+}
 
-	if cfg.ProfileMemory && cfg.UProfSudo {
-		fmt.Println("Acquiring sudo credentials for AMD uProf...")
-		cmd := exec.Command("sudo", "-v")
-		cmd.Stdin = os.Stdin
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: sudo credentials unavailable: %v; disabling uProf\n", err)
-			cfg.ProfileMemory = false
-		} else if cfg.ModprobeUncore {
-			if err := exec.Command("sudo", "-n", "modprobe", "amd_uncore").Run(); err != nil {
-				fmt.Fprintf(os.Stderr, "warning: sudo modprobe amd_uncore failed: %v\n", err)
-			}
+func setupMemoryProfiler(cfg config) config {
+	if !cfg.ProfileMemory || !cfg.UProfSudo {
+		return cfg
+	}
+	fmt.Println("Acquiring sudo credentials for AMD uProf...")
+	cmd := exec.Command("sudo", "-v")
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	if err := cmd.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: sudo credentials unavailable: %v; disabling uProf\n", err)
+		cfg.ProfileMemory = false
+		return cfg
+	}
+	if cfg.ModprobeUncore {
+		if err := exec.Command("sudo", "-n", "modprobe", "amd_uncore").Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: sudo modprobe amd_uncore failed: %v\n", err)
 		}
 	}
+	return cfg
+}
 
-	writeEnvironmentSnapshot(cfg)
-
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
-
+func loadBenchmarkState(cfg config, threads []int) ([]experiment, []runResult) {
 	experiments, err := expandExperiments(cfg)
 	if err != nil {
 		fatalf("experiment matrix: %v", err)
 	}
 	var results []runResult
 	if cfg.Resume {
-		results, err = loadResumableResults(cfg.OutputDir, experiments, threadValues, cfg.Runs)
+		results, err = loadResumableResults(cfg.OutputDir, experiments, threads, cfg.Runs)
 		if err != nil {
 			fatalf("load resumable results: %v", err)
 		}
 		fmt.Printf("Resuming %d successful counted runs from %s; failed or missing runs will be retried.\n", len(results), cfg.OutputDir)
 	}
+	return experiments, results
+}
+
+func inspectExperimentFits(ctx context.Context, cfg config, experiments []experiment) (map[string]string, map[string]int) {
 	fitByConfig := make(map[string]string)
 	fitSpillByConfig := make(map[string]int)
-	if cfg.InspectFit {
-		for _, experiment := range experiments {
-			select {
-			case <-ctx.Done():
-				fatalf("interrupted")
-			default:
-			}
-			dir := filepath.Join(cfg.OutputDir, "configs", experiment.Name)
-			if cfg.Resume {
-				if out, readErr := os.ReadFile(filepath.Join(dir, "fit.txt")); readErr == nil && len(out) > 0 {
-					fitByConfig[experiment.Key] = string(out)
-					fitSpillByConfig[experiment.Key] = countFitSpillBlocks(string(out))
-					continue
-				}
-			}
-			if err := os.MkdirAll(dir, 0o755); err != nil {
-				fmt.Fprintf(os.Stderr, "warning: create fit directory: %v\n", err)
-				continue
-			}
-			out, fitErr := inspectFit(ctx, experiment.Config)
-			if fitErr != nil {
-				fmt.Fprintf(os.Stderr, "warning: fit inspection %s failed: %v\n", experiment.Name, fitErr)
-			}
-			fitByConfig[experiment.Key] = out
-			fitSpillByConfig[experiment.Key] = countFitSpillBlocks(out)
-			if err := os.WriteFile(filepath.Join(dir, "fit.txt"), []byte(out), 0o644); err != nil {
-				fmt.Fprintf(os.Stderr, "warning: write fit output: %v\n", err)
-			}
-		}
+	if !cfg.InspectFit {
+		return fitByConfig, fitSpillByConfig
 	}
 	for _, experiment := range experiments {
+		if ctx.Err() != nil {
+			fatalf("interrupted")
+		}
+		inspectExperimentFit(ctx, cfg, experiment, fitByConfig, fitSpillByConfig)
+	}
+	return fitByConfig, fitSpillByConfig
+}
+
+func inspectExperimentFit(ctx context.Context, cfg config, experiment experiment, fitByConfig map[string]string, fitSpillByConfig map[string]int) {
+	dir := filepath.Join(cfg.OutputDir, "configs", experiment.Name)
+	fitPath := filepath.Join(dir, "fit.txt")
+	if cfg.Resume {
+		if output, err := os.ReadFile(fitPath); err == nil && len(output) > 0 {
+			fitByConfig[experiment.Key] = string(output)
+			fitSpillByConfig[experiment.Key] = countFitSpillBlocks(string(output))
+			return
+		}
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: create fit directory: %v\n", err)
+		return
+	}
+	output, fitErr := inspectFit(ctx, experiment.Config)
+	if fitErr != nil {
+		fmt.Fprintf(os.Stderr, "warning: fit inspection %s failed: %v\n", experiment.Name, fitErr)
+	}
+	fitByConfig[experiment.Key] = output
+	fitSpillByConfig[experiment.Key] = countFitSpillBlocks(output)
+	if err := os.WriteFile(fitPath, []byte(output), 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: write fit output: %v\n", err)
+	}
+}
+
+func runExperimentMatrix(ctx context.Context, cfg config, threadValues []int, experiments []experiment, fitByConfig map[string]string, fitSpillByConfig map[string]int, results *[]runResult) bool {
+	for _, experiment := range experiments {
 		for _, threads := range experimentThreadValues(experiment, threadValues) {
-			if cfg.Resume && cellComplete(cfg.OutputDir, experiment, threads, cfg.Runs, cfg.WarmupRuns) {
-				fmt.Printf("\n=== already complete %s threads=%d; skipping ===\n", experiment.Name, threads)
+			if shouldSkipCell(cfg, experiment, threads) {
 				continue
 			}
-			select {
-			case <-ctx.Done():
-				if err := writeAllSummaries(cfg.OutputDir, results); err != nil {
-					fmt.Fprintf(os.Stderr, "write partial summaries: %v\n", err)
-				}
-				fmt.Println("Interrupted; partial results written.")
-				return
-			default:
+			interrupted, err := runExperimentCell(ctx, cfg, experiment, threads, fitByConfig, fitSpillByConfig, results)
+			if err != nil {
+				fatalf("benchmark cell failed: %v", err)
 			}
-
-			fmt.Printf("\n=== starting %s threads=%d ===\n", experiment.Name, threads)
-			session, startErr := startServerSession(ctx, experiment.Config, experiment.Name, threads)
-			if startErr != nil {
-				fatalf("start server for %s threads=%d: %v", experiment.Name, threads, startErr)
-			}
-
-			for warmup := 1; warmup <= cfg.WarmupRuns; warmup++ {
-				if ctx.Err() != nil {
-					break
-				}
-				// Every server session needs its own warm-up. A prior warm-up result
-				// cannot warm the freshly restarted server used when resuming missing
-				// counted repetitions, so rerun it for each incomplete cell.
-				fmt.Printf("\n=== warm-up %d/%d %s threads=%d ===\n", warmup, cfg.WarmupRuns, experiment.Name, threads)
-				warmupResult := executeRun(ctx, experiment.Config, experiment.Name, experiment.Key, threads, -warmup,
-					fitByConfig[experiment.Key], fitSpillByConfig[experiment.Key], session)
-				if warmupResult.ExitCode != 0 {
-					session.stop()
-					fatalf("warm-up failed in %s: %s", warmupResult.RunDir, warmupResult.Error)
-				}
-			}
-
-			for rep := 1; rep <= cfg.Runs && ctx.Err() == nil; rep++ {
-				if cfg.Resume && resumableResult(cfg.OutputDir, experiment, threads, rep) {
-					fmt.Printf("\n=== %s threads=%d run=%d/%d already complete; skipping ===\n", experiment.Name, threads, rep, cfg.Runs)
-					continue
-				}
-				fmt.Printf("\n=== %s threads=%d run=%d/%d ===\n", experiment.Name, threads, rep, cfg.Runs)
-				res := executeRun(ctx, experiment.Config, experiment.Name, experiment.Key, threads, rep,
-					fitByConfig[experiment.Key], fitSpillByConfig[experiment.Key], session)
-				results = append(results, res)
-				printRunSummary(res)
-				if err := writeAllSummaries(cfg.OutputDir, results); err != nil {
-					session.stop()
-					fatalf("write summaries: %v", err)
-				}
-				if res.ExitCode != 0 && cfg.FailFast {
-					session.stop()
-					fatalf("client failed in %s", res.RunDir)
-				}
-			}
-			session.stop()
-			if ctx.Err() != nil {
-				if err := writeAllSummaries(cfg.OutputDir, results); err != nil {
-					fmt.Fprintf(os.Stderr, "write partial summaries: %v\n", err)
-				}
-				fmt.Println("Interrupted; partial results written.")
-				return
+			if interrupted {
+				return true
 			}
 		}
 	}
+	return false
+}
 
-	fmt.Println()
-	printAggregateSummary(results)
-	fmt.Printf("\nResults: %s\n", cfg.OutputDir)
+func shouldSkipCell(cfg config, experiment experiment, threads int) bool {
+	if cfg.Resume && cellComplete(cfg.OutputDir, experiment, threads, cfg.Runs, cfg.WarmupRuns) {
+		fmt.Printf("\n=== already complete %s threads=%d; skipping ===\n", experiment.Name, threads)
+		return true
+	}
+	return false
+}
+
+func runExperimentCell(ctx context.Context, cfg config, experiment experiment, threads int, fitByConfig map[string]string, fitSpillByConfig map[string]int, results *[]runResult) (bool, error) {
+	if ctx.Err() != nil {
+		writePartialSummaries(cfg.OutputDir, *results)
+		return true, nil
+	}
+	fmt.Printf("\n=== starting %s threads=%d ===\n", experiment.Name, threads)
+	session, err := startServerSession(ctx, experiment.Config, experiment.Name, threads)
+	if err != nil {
+		return false, fmt.Errorf("start server for %s threads=%d: %w", experiment.Name, threads, err)
+	}
+	if err := runWarmups(ctx, cfg, experiment, threads, fitByConfig, fitSpillByConfig, session); err != nil {
+		session.stop()
+		return false, err
+	}
+	if err := runCountedRepetitions(ctx, cfg, experiment, threads, fitByConfig, fitSpillByConfig, session, results); err != nil {
+		session.stop()
+		return false, err
+	}
+	session.stop()
+	if ctx.Err() != nil {
+		writePartialSummaries(cfg.OutputDir, *results)
+		return true, nil
+	}
+	return false, nil
+}
+
+func runWarmups(ctx context.Context, cfg config, experiment experiment, threads int, fitByConfig map[string]string, fitSpillByConfig map[string]int, session *serverSession) error {
+	for warmup := 1; warmup <= cfg.WarmupRuns && ctx.Err() == nil; warmup++ {
+		fmt.Printf("\n=== warm-up %d/%d %s threads=%d ===\n", warmup, cfg.WarmupRuns, experiment.Name, threads)
+		result := executeRun(ctx, experiment.Config, experiment.Name, experiment.Key, threads, -warmup,
+			fitByConfig[experiment.Key], fitSpillByConfig[experiment.Key], session)
+		if result.ExitCode != 0 {
+			return fmt.Errorf("warm-up failed in %s: %s", result.RunDir, result.Error)
+		}
+	}
+	return nil
+}
+
+func runCountedRepetitions(ctx context.Context, cfg config, experiment experiment, threads int, fitByConfig map[string]string, fitSpillByConfig map[string]int, session *serverSession, results *[]runResult) error {
+	for rep := 1; rep <= cfg.Runs && ctx.Err() == nil; rep++ {
+		if cfg.Resume && resumableResult(cfg.OutputDir, experiment, threads, rep) {
+			fmt.Printf("\n=== %s threads=%d run=%d/%d already complete; skipping ===\n", experiment.Name, threads, rep, cfg.Runs)
+			continue
+		}
+		fmt.Printf("\n=== %s threads=%d run=%d/%d ===\n", experiment.Name, threads, rep, cfg.Runs)
+		result := executeRun(ctx, experiment.Config, experiment.Name, experiment.Key, threads, rep,
+			fitByConfig[experiment.Key], fitSpillByConfig[experiment.Key], session)
+		*results = append(*results, result)
+		printRunSummary(result)
+		if err := writeAllSummaries(cfg.OutputDir, *results); err != nil {
+			return fmt.Errorf("write summaries: %w", err)
+		}
+		if result.ExitCode != 0 && cfg.FailFast {
+			return fmt.Errorf("client failed in %s", result.RunDir)
+		}
+	}
+	return nil
+}
+
+func writePartialSummaries(outputDir string, results []runResult) {
+	if err := writeAllSummaries(outputDir, results); err != nil {
+		fmt.Fprintf(os.Stderr, "write partial summaries: %v\n", err)
+	}
+	fmt.Println("Interrupted; partial results written.")
 }
 
 func parseFlags() config {
 	var cfg config
+	registerRunFlags(&cfg)
+	registerMatrixFlags(&cfg)
+	registerModelFlags(&cfg)
+	registerProfilerFlags(&cfg)
+	flag.Var(&cfg.ServerArgs, "server-arg", "extra llama-server argument; repeat for multiple arguments")
+	flag.Var(&cfg.ServerEnv, "server-env", "extra server environment KEY=VALUE; repeatable")
+	flag.Var(&cfg.ClientEnv, "client-env", "extra client environment KEY=VALUE; repeatable")
+	flag.Parse()
+	return cfg
+}
+
+func registerRunFlags(cfg *config) {
 	flag.StringVar(&cfg.WorkDir, "workdir", "../llama.cpp", "llama.cpp checkout root")
 	flag.StringVar(&cfg.OutputDir, "out", "./benchmark-runs", "output directory")
 	flag.StringVar(&cfg.ClientCmd, "client-cmd", "", "client benchmark command, executed through --shell (default: standalone prompt run.sh)")
@@ -604,6 +690,14 @@ func parseFlags() config {
 	flag.IntVar(&cfg.Runs, "runs", 7, "runs per THREADS value")
 	flag.IntVar(&cfg.WarmupRuns, "warmup-runs", 0, "warm-up runs per configuration, excluded from summaries")
 	flag.StringVar(&cfg.ThreadValues, "threads", "6,8,12", "comma-separated llama.cpp CPU thread counts")
+	flag.BoolVar(&cfg.FailFast, "fail-fast", false, "stop on first client failure")
+	flag.BoolVar(&cfg.Resume, "resume", false, "resume an existing output directory, reusing only successful matching runs")
+	flag.DurationVar(&cfg.ClientTimeout, "client-timeout", 30*time.Minute, "maximum duration of one client benchmark")
+	flag.DurationVar(&cfg.HealthTimeout, "health-timeout", 10*time.Minute, "server startup/health timeout")
+	flag.DurationVar(&cfg.ServerSettle, "server-settle", 500*time.Millisecond, "delay after server becomes healthy")
+}
+
+func registerMatrixFlags(cfg *config) {
 	flag.StringVar(&cfg.ContextValues, "ctx-values", "", "total context/KV pool values; combines with other axes as a Cartesian product")
 	flag.StringVar(&cfg.ParallelValues, "parallel-values", "", "parallel slot values; combines with other axes as a Cartesian product")
 	flag.StringVar(&cfg.BatchValues, "batch-values", "", "logical batch values; combines with other axes as a Cartesian product")
@@ -616,12 +710,9 @@ func parseFlags() config {
 	flag.StringVar(&cfg.PreserveThinkValues, "preserve-thinking-values", "", "true/false prompt-session types; combines with other axes as a Cartesian product")
 	flag.StringVar(&cfg.CacheReuseValues, "cache-reuse-values", "", "cache-reuse chunk values; combines with other axes as a Cartesian product")
 	flag.StringVar(&cfg.FlashAttentionValues, "flash-attn-values", "", "FlashAttention values (on/off/auto); combines with other axes as a Cartesian product")
-	flag.BoolVar(&cfg.FailFast, "fail-fast", false, "stop on first client failure")
-	flag.BoolVar(&cfg.Resume, "resume", false, "resume an existing output directory, reusing only successful matching runs")
-	flag.DurationVar(&cfg.ClientTimeout, "client-timeout", 30*time.Minute, "maximum duration of one client benchmark")
-	flag.DurationVar(&cfg.HealthTimeout, "health-timeout", 10*time.Minute, "server startup/health timeout")
-	flag.DurationVar(&cfg.ServerSettle, "server-settle", 500*time.Millisecond, "delay after server becomes healthy")
+}
 
+func registerModelFlags(cfg *config) {
 	flag.StringVar(&cfg.ServerBinary, "server", "./build-vulkan/bin/llama-server", "llama-server binary")
 	flag.StringVar(&cfg.FitBinary, "fit-binary", "./build-vulkan/bin/llama-fit-params", "llama-fit-params binary")
 	flag.BoolVar(&cfg.InspectFit, "inspect-fit", true, "run llama-fit-params once for each server configuration")
@@ -652,7 +743,9 @@ func parseFlags() config {
 	flag.Float64Var(&cfg.StarvationThreshold, "starvation-threshold", 1.0, "tg_3s tokens/sec threshold for a decode-starvation event")
 	flag.Int64Var(&cfg.LargePrefillTokens, "large-prefill-tokens", 2048, "minimum prompt tokens to count as a large prefill")
 	flag.IntVar(&cfg.LogVerbosity, "log-verbosity", 3, "llama.cpp log verbosity")
+}
 
+func registerProfilerFlags(cfg *config) {
 	flag.StringVar(&cfg.AmdSMI, "amd-smi", "amd-smi", "amd-smi executable")
 	flag.IntVar(&cfg.GPU, "gpu", 0, "AMD GPU index")
 	flag.BoolVar(&cfg.ProfileGPU, "profile-gpu", true, "capture amd-smi GPU metrics")
@@ -660,13 +753,6 @@ func parseFlags() config {
 	flag.BoolVar(&cfg.ProfileMemory, "profile-memory", true, "capture AMD uProf memory bandwidth")
 	flag.BoolVar(&cfg.UProfSudo, "uprof-sudo", true, "run AMDuProfPcm under sudo")
 	flag.BoolVar(&cfg.ModprobeUncore, "modprobe-amd-uncore", true, "sudo modprobe amd_uncore before profiling")
-
-	flag.Var(&cfg.ServerArgs, "server-arg", "extra llama-server argument; repeat for multiple arguments")
-	flag.Var(&cfg.ServerEnv, "server-env", "extra server environment KEY=VALUE; repeatable")
-	flag.Var(&cfg.ClientEnv, "client-env", "extra client environment KEY=VALUE; repeatable")
-	flag.Parse()
-
-	return cfg
 }
 
 func parseThreadValues(s string) ([]int, error) {
@@ -766,128 +852,132 @@ func expandExperiments(base config) ([]experiment, error) {
 	if strings.TrimSpace(base.PlanFile) != "" {
 		return expandCoveragePlan(base)
 	}
-	type axis struct {
-		name   string
-		values []string
-		apply  func(*config, string) error
+	configs, err := expandConfigAxes(base, experimentAxes(base))
+	if err != nil {
+		return nil, err
 	}
-	valuesWithBase := func(baseValue, values string) []string {
-		out := []string{baseValue}
-		seen := map[string]bool{baseValue: true}
-		for _, value := range splitAxis(values) {
-			value = strings.TrimSpace(value)
-			if value != "" && !seen[value] {
-				out = append(out, value)
-				seen[value] = true
-			}
-		}
-		return out
-	}
-	intAxis := func(name, values string, baseValue int, set func(*config, int)) (axis, bool) {
-		if strings.TrimSpace(values) == "" {
-			return axis{}, false
-		}
-		return axis{
-			name:   name,
-			values: valuesWithBase(strconv.Itoa(baseValue), values),
-			apply: func(c *config, value string) error {
-				n, err := strconv.Atoi(value)
-				if err != nil || n < 1 {
-					return errors.New("must be a positive integer")
-				}
-				set(c, n)
-				return nil
-			},
-		}, true
-	}
-	stringAxis := func(name, values, baseValue string, set func(*config, string)) (axis, bool) {
-		if strings.TrimSpace(values) == "" {
-			return axis{}, false
-		}
-		return axis{
-			name:   name,
-			values: valuesWithBase(baseValue, values),
-			apply: func(c *config, value string) error {
-				set(c, value)
-				return nil
-			},
-		}, true
-	}
+	return experimentsFromConfigs(base, configs), nil
+}
 
-	var axes []axis
-	appendAxis := func(current axis, ok bool) {
-		if ok {
-			axes = append(axes, current)
+func axisValuesWithBase(baseValue, values string) []string {
+	out := []string{baseValue}
+	seen := map[string]bool{baseValue: true}
+	for _, value := range splitAxis(values) {
+		value = strings.TrimSpace(value)
+		if value != "" && !seen[value] {
+			out = append(out, value)
+			seen[value] = true
 		}
 	}
-	appendAxis(intAxis("parallel", base.ParallelValues, base.Parallel, func(c *config, v int) { c.Parallel = v }))
-	appendAxis(intAxis("context", base.ContextValues, base.Context, func(c *config, v int) { c.Context = v }))
-	appendAxis(intAxis("batch", base.BatchValues, base.Batch, func(c *config, v int) { c.Batch = v }))
-	appendAxis(intAxis("ubatch", base.UBatchValues, base.UBatch, func(c *config, v int) { c.UBatch = v }))
-	appendAxis(intAxis("fit-target", base.FitTargetValues, base.FitTarget, func(c *config, v int) { c.FitTarget = v }))
-	appendAxis(stringAxis("kv-k", base.KVKValues, base.KVK, func(c *config, v string) { c.KVK = v }))
-	appendAxis(stringAxis("kv-v", base.KVVValues, base.KVV, func(c *config, v string) { c.KVV = v }))
-	appendAxis(stringAxis("model", base.ModelValues, base.Model, func(c *config, v string) { c.Model = v }))
+	return out
+}
+
+func intExperimentAxis(name, values string, baseValue int, set func(*config, int)) (experimentAxis, bool) {
+	if strings.TrimSpace(values) == "" {
+		return experimentAxis{}, false
+	}
+	return experimentAxis{
+		name: name, values: axisValuesWithBase(strconv.Itoa(baseValue), values),
+		apply: func(c *config, value string) error {
+			n, err := strconv.Atoi(value)
+			if err != nil || n < 1 {
+				return errors.New("must be a positive integer")
+			}
+			set(c, n)
+			return nil
+		},
+	}, true
+}
+
+func stringExperimentAxis(name, values, baseValue string, set func(*config, string)) (experimentAxis, bool) {
+	if strings.TrimSpace(values) == "" {
+		return experimentAxis{}, false
+	}
+	return experimentAxis{
+		name: name, values: axisValuesWithBase(baseValue, values),
+		apply: func(c *config, value string) error { set(c, value); return nil },
+	}, true
+}
+
+func experimentAxes(base config) []experimentAxis {
+	var axes []experimentAxis
+	add := func(axis experimentAxis, ok bool) {
+		if ok {
+			axes = append(axes, axis)
+		}
+	}
+	add(intExperimentAxis("parallel", base.ParallelValues, base.Parallel, func(c *config, v int) { c.Parallel = v }))
+	add(intExperimentAxis("context", base.ContextValues, base.Context, func(c *config, v int) { c.Context = v }))
+	add(intExperimentAxis("batch", base.BatchValues, base.Batch, func(c *config, v int) { c.Batch = v }))
+	add(intExperimentAxis("ubatch", base.UBatchValues, base.UBatch, func(c *config, v int) { c.UBatch = v }))
+	add(intExperimentAxis("fit-target", base.FitTargetValues, base.FitTarget, func(c *config, v int) { c.FitTarget = v }))
+	add(stringExperimentAxis("kv-k", base.KVKValues, base.KVK, func(c *config, v string) { c.KVK = v }))
+	add(stringExperimentAxis("kv-v", base.KVVValues, base.KVV, func(c *config, v string) { c.KVV = v }))
+	add(stringExperimentAxis("model", base.ModelValues, base.Model, func(c *config, v string) { c.Model = v }))
+	return appendOptionalExperimentAxes(base, axes)
+}
+
+func appendOptionalExperimentAxes(base config, axes []experimentAxis) []experimentAxis {
 	if strings.TrimSpace(base.CacheReuseValues) != "" {
-		axes = append(axes, axis{
-			name:   "cache-reuse",
-			values: valuesWithBase(strconv.Itoa(base.CacheReuse), base.CacheReuseValues),
-			apply: func(c *config, value string) error {
-				n, err := strconv.Atoi(value)
-				if err != nil || n < 0 {
-					return errors.New("must be a non-negative integer")
-				}
-				c.CacheReuse = n
-				return nil
-			},
-		})
+		axes = append(axes, experimentAxis{name: "cache-reuse", values: axisValuesWithBase(strconv.Itoa(base.CacheReuse), base.CacheReuseValues), apply: setCacheReuse})
 	}
 	if strings.TrimSpace(base.FlashAttentionValues) != "" {
-		axes = append(axes, axis{
-			name:   "flash-attention",
-			values: valuesWithBase(base.FlashAttention, base.FlashAttentionValues),
-			apply: func(c *config, value string) error {
-				value = strings.ToLower(strings.TrimSpace(value))
-				switch value {
-				case "on", "off", "auto":
-					c.FlashAttention = value
-					return nil
-				default:
-					return errors.New("must be on, off, or auto")
-				}
-			},
-		})
+		axes = append(axes, experimentAxis{name: "flash-attention", values: axisValuesWithBase(base.FlashAttention, base.FlashAttentionValues), apply: setFlashAttention})
 	}
 	if strings.TrimSpace(base.PreserveThinkValues) != "" {
-		axes = append(axes, axis{
-			name:   "preserve-thinking",
-			values: valuesWithBase(strconv.FormatBool(base.PreserveThink), base.PreserveThinkValues),
-			apply: func(c *config, value string) error {
-				v, err := strconv.ParseBool(value)
-				if err != nil {
-					return errors.New("must be true or false")
-				}
-				c.PreserveThink = v
-				return nil
-			},
-		})
+		axes = append(axes, experimentAxis{name: "preserve-thinking", values: axisValuesWithBase(strconv.FormatBool(base.PreserveThink), base.PreserveThinkValues), apply: setPreserveThinking})
 	}
+	return axes
+}
 
+func setCacheReuse(c *config, value string) error {
+	n, err := strconv.Atoi(value)
+	if err != nil || n < 0 {
+		return errors.New("must be a non-negative integer")
+	}
+	c.CacheReuse = n
+	return nil
+}
+
+func setFlashAttention(c *config, value string) error {
+	value = strings.ToLower(strings.TrimSpace(value))
+	switch value {
+	case "on", "off", "auto":
+		c.FlashAttention = value
+		return nil
+	default:
+		return errors.New("must be on, off, or auto")
+	}
+}
+
+func setPreserveThinking(c *config, value string) error {
+	preserve, err := strconv.ParseBool(value)
+	if err != nil {
+		return errors.New("must be true or false")
+	}
+	c.PreserveThink = preserve
+	return nil
+}
+
+func expandConfigAxes(base config, axes []experimentAxis) ([]config, error) {
 	configs := []config{base}
-	for _, currentAxis := range axes {
-		next := make([]config, 0, len(configs)*len(currentAxis.values))
+	for _, axis := range axes {
+		next := make([]config, 0, len(configs)*len(axis.values))
 		for _, partial := range configs {
-			for _, value := range currentAxis.values {
+			for _, value := range axis.values {
 				candidate := partial
-				if err := currentAxis.apply(&candidate, value); err != nil {
-					return nil, fmt.Errorf("%s value %q: %w", currentAxis.name, value, err)
+				if err := axis.apply(&candidate, value); err != nil {
+					return nil, fmt.Errorf("%s value %q: %w", axis.name, value, err)
 				}
 				next = append(next, candidate)
 			}
 		}
 		configs = next
 	}
+	return configs, nil
+}
 
+func experimentsFromConfigs(base config, configs []config) []experiment {
 	out := make([]experiment, 0, len(configs))
 	seen := make(map[string]bool)
 	for _, candidate := range configs {
@@ -898,7 +988,7 @@ func expandExperiments(base config) ([]experiment, error) {
 		seen[key] = true
 		out = append(out, experiment{Name: experimentName(base, candidate), Key: key, Config: candidate})
 	}
-	return out, nil
+	return out
 }
 
 func expandCoveragePlan(base config) ([]experiment, error) {
@@ -1220,15 +1310,32 @@ func fitArgs(cfg config) []string {
 	return args
 }
 
+type runExecution struct {
+	runDir   string
+	llamaLog string
+	logStart int64
+}
+
 func executeRun(parent context.Context, cfg config, configName, configKey string, threads, rep int, fitOut string, fitSpill int, session *serverSession) runResult {
+	execution, failed := prepareRun(cfg, configName, configKey, threads, rep, fitOut, fitSpill, session)
+	if failed != nil {
+		return *failed
+	}
+	profilers := startRunProfilers(cfg, threads, rep, execution.runDir)
+	return collectRun(parent, cfg, configName, configKey, threads, rep, fitOut, fitSpill, session, *execution, profilers)
+}
+
+func prepareRun(cfg config, configName, configKey string, threads, rep int, fitOut string, fitSpill int, session *serverSession) (*runExecution, *runResult) {
 	root := experimentRoot(cfg.OutputDir, configName)
 	runDir := filepath.Join(root, fmt.Sprintf("threads-%02d", threads), repetitionDir(rep))
 	if err := os.MkdirAll(runDir, 0o755); err != nil {
-		return runResult{ConfigName: configName, ConfigKey: configKey, ThreadCount: threads, Repetition: rep, RunDir: runDir, ExitCode: -1, Error: err.Error()}
+		failed := runResult{ConfigName: configName, ConfigKey: configKey, ThreadCount: threads, Repetition: rep, RunDir: runDir, ExitCode: -1, Error: err.Error()}
+		return nil, &failed
 	}
 	opencodeConfigPath := filepath.Join(runDir, "opencode.json")
 	if err := writeRunOpenCodeConfig(cfg.OpenCodeConfig, opencodeConfigPath, session.baseURL+"/v1", cfg.Context); err != nil {
-		return failedRun(configName, configKey, threads, rep, runDir, fitOut, fitSpill, fmt.Errorf("prepare OpenCode config: %w", err))
+		failed := failedRun(configName, configKey, threads, rep, runDir, fitOut, fitSpill, fmt.Errorf("prepare OpenCode config: %w", err))
+		return nil, &failed
 	}
 
 	llamaLog := filepath.Join(runDir, "llama.log")
@@ -1237,19 +1344,28 @@ func executeRun(parent context.Context, cfg config, configName, configKey string
 		if serverErr == nil {
 			serverErr = errors.New("server exited")
 		}
-		return failedRun(configName, configKey, threads, rep, runDir, fitOut, fitSpill, fmt.Errorf("server unavailable: %w", serverErr))
+		failed := failedRun(configName, configKey, threads, rep, runDir, fitOut, fitSpill, fmt.Errorf("server unavailable: %w", serverErr))
+		return nil, &failed
 	}
-	serverCommand := append([]string{cfg.ServerBinary}, serverArgs(cfg, threads, session.logPath)...)
+	if err := writeRunMetadata(cfg, configName, configKey, threads, rep, runDir, opencodeConfigPath, session); err != nil {
+		failed := failedRun(configName, configKey, threads, rep, runDir, fitOut, fitSpill, fmt.Errorf("write metadata: %w", err))
+		return nil, &failed
+	}
+
+	logStart, err := logFileSize(session.logPath)
+	if err != nil {
+		failed := failedRun(configName, configKey, threads, rep, runDir, fitOut, fitSpill, fmt.Errorf("server log: %w", err))
+		return nil, &failed
+	}
+	return &runExecution{runDir: runDir, llamaLog: llamaLog, logStart: logStart}, nil
+}
+
+func writeRunMetadata(cfg config, configName, configKey string, threads, rep int, runDir, opencodeConfigPath string, session *serverSession) error {
 	meta := runMeta{
-		StartedAt:     time.Now().Format(time.RFC3339Nano),
-		ConfigName:    configName,
-		ConfigKey:     configKey,
-		Warmup:        rep < 0,
-		Threads:       threads,
-		Repetition:    rep,
-		ClientCommand: cfg.ClientCmd,
-		Shell:         cfg.Shell,
-		ServerCommand: serverCommand,
+		StartedAt: time.Now().Format(time.RFC3339Nano), ConfigName: configName,
+		ConfigKey: configKey, Warmup: rep < 0, Threads: threads, Repetition: rep,
+		ClientCommand: cfg.ClientCmd, Shell: cfg.Shell,
+		ServerCommand: append([]string{cfg.ServerBinary}, serverArgs(cfg, threads, session.logPath)...),
 		ServerEnv:     append([]string(nil), cfg.ServerEnv...),
 		ClientEnv:     clientEnvironment(cfg, threads, rep, runDir, opencodeConfigPath),
 		GitCommit:     gitCommit(cfg.WorkDir),
@@ -1259,156 +1375,141 @@ func executeRun(parent context.Context, cfg config, configName, configKey string
 			"prompt_session_type": promptSessionType(cfg.PreserveThink),
 			"kv_k":                cfg.KVK, "kv_v": cfg.KVV, "batch": cfg.Batch, "ubatch": cfg.UBatch,
 			"fit_target": cfg.FitTarget, "cache_reuse": cfg.CacheReuse, "unified_kv": cfg.UnifiedKV,
-			"flash_attention":          cfg.FlashAttention,
-			"kv_per_slot":              cfg.KVPerSlot,
+			"flash_attention": cfg.FlashAttention, "kv_per_slot": cfg.KVPerSlot,
 			"starvation_threshold_tps": cfg.StarvationThreshold,
 			"large_prefill_tokens":     cfg.LargePrefillTokens,
 		},
 	}
-	if err := writeJSON(filepath.Join(runDir, "meta.json"), meta); err != nil {
-		return failedRun(configName, configKey, threads, rep, runDir, fitOut, fitSpill, fmt.Errorf("write metadata: %w", err))
-	}
+	return writeJSON(filepath.Join(runDir, "meta.json"), meta)
+}
 
-	logStart, err := logFileSize(session.logPath)
-	if err != nil {
-		return failedRun(configName, configKey, threads, rep, runDir, fitOut, fitSpill, fmt.Errorf("server log: %w", err))
-	}
+type runProfilers struct {
+	gpuProc      *managedProc
+	uprofProc    *managedProc
+	gpuStatus    string
+	memoryStatus string
+}
 
-	var gpuProc, uprofProc *managedProc
-	gpuStatus, memoryStatus := "disabled", "disabled"
+func startRunProfilers(cfg config, threads, rep int, runDir string) runProfilers {
+	profilers := runProfilers{gpuStatus: "disabled", memoryStatus: "disabled"}
 	if cfg.ProfileGPU {
-		gpuStatus = "unavailable"
-		gpuPath := filepath.Join(runDir, "gpu.csv")
-		gpuErrPath := filepath.Join(runDir, "gpu.err.log")
-		gpuFile, e := os.Create(gpuPath)
-		if e == nil {
-			gpuErr, e2 := os.Create(gpuErrPath)
-			if e2 == nil {
-				gpuCmd := exec.Command(cfg.AmdSMI, "monitor",
-					"--gpu", strconv.Itoa(cfg.GPU),
-					"--power-usage", "--gfx", "--mem", "--vram-usage",
-					"--watch", "1", "--csv")
-				gpuCmd.Dir = cfg.WorkDir
-				gpuCmd.Stdout = gpuFile
-				gpuCmd.Stderr = gpuErr
-				gpuProc, err = startManaged(gpuCmd)
-				if err == nil {
-					gpuStatus = "running"
-				}
-				_ = gpuFile.Close()
-				_ = gpuErr.Close()
-				if err != nil {
-					gpuStatus = "failed to start: " + err.Error()
-					fmt.Fprintf(os.Stderr, "warning: amd-smi start failed: %v\n", err)
-				}
-			} else {
-				_ = gpuFile.Close()
-			}
-		}
+		profilers.gpuProc, profilers.gpuStatus = startGPUProfiler(cfg, runDir)
 	}
-
 	if cfg.ProfileMemory {
-		memoryStatus = "unavailable"
-		uprofPath := filepath.Join(runDir, "memory.csv")
-		uprofConsolePath := filepath.Join(runDir, "uprof-console.log")
-		uprofConsole, e := os.Create(uprofConsolePath)
-		if e != nil {
-			fmt.Fprintf(os.Stderr, "warning: uProf console log: %v\n", e)
-		} else {
-			var argv []string
-			if cfg.UProfSudo {
-				argv = []string{"sudo", "-n", cfg.UProf}
-			} else {
-				argv = []string{cfg.UProf}
-			}
-			argv = append(argv, "-m", "memory", "-a", "-A", "system,package", "-s", "-o", uprofPath)
-			uprofCmd := exec.Command(argv[0], argv[1:]...)
-			uprofCmd.Dir = cfg.WorkDir
-			uprofCmd.Stdout = uprofConsole
-			uprofCmd.Stderr = uprofConsole
-			uprofProc, err = startManaged(uprofCmd)
-			if err == nil {
-				memoryStatus = "running"
-			}
-			_ = uprofConsole.Close()
-			if err != nil {
-				memoryStatus = "failed to start: " + err.Error()
-				fmt.Fprintf(os.Stderr, "warning: AMDuProfPcm start failed: %v\n", err)
-			}
-		}
+		profilers.uprofProc, profilers.memoryStatus = startMemoryProfiler(cfg, runDir)
 	}
+	return profilers
+}
 
-	metricsCancel, metricsDone := startMetricSampler(parent, session.baseURL+"/metrics", filepath.Join(runDir, "metrics.csv"))
+func startGPUProfiler(cfg config, runDir string) (*managedProc, string) {
+	status := "unavailable"
+	gpuFile, err := os.Create(filepath.Join(runDir, "gpu.csv"))
+	if err != nil {
+		return nil, status
+	}
+	gpuErr, err := os.Create(filepath.Join(runDir, "gpu.err.log"))
+	if err != nil {
+		_ = gpuFile.Close()
+		return nil, status
+	}
+	cmd := exec.Command(cfg.AmdSMI, "monitor", "--gpu", strconv.Itoa(cfg.GPU), "--power-usage", "--gfx", "--mem", "--vram-usage", "--watch", "1", "--csv")
+	cmd.Dir = cfg.WorkDir
+	cmd.Stdout, cmd.Stderr = gpuFile, gpuErr
+	proc, startErr := startManaged(cmd)
+	_ = gpuFile.Close()
+	_ = gpuErr.Close()
+	if startErr != nil {
+		status = "failed to start: " + startErr.Error()
+		fmt.Fprintf(os.Stderr, "warning: amd-smi start failed: %v\n", startErr)
+		return nil, status
+	}
+	return proc, "running"
+}
 
+func startMemoryProfiler(cfg config, runDir string) (*managedProc, string) {
+	status := "unavailable"
+	console, err := os.Create(filepath.Join(runDir, "uprof-console.log"))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: uProf console log: %v\n", err)
+		return nil, status
+	}
+	argv := []string{cfg.UProf}
+	if cfg.UProfSudo {
+		argv = []string{"sudo", "-n", cfg.UProf}
+	}
+	argv = append(argv, "-m", "memory", "-a", "-A", "system,package", "-s", "-o", filepath.Join(runDir, "memory.csv"))
+	cmd := exec.Command(argv[0], argv[1:]...)
+	cmd.Dir = cfg.WorkDir
+	cmd.Stdout, cmd.Stderr = console, console
+	proc, startErr := startManaged(cmd)
+	_ = console.Close()
+	if startErr != nil {
+		status = "failed to start: " + startErr.Error()
+		fmt.Fprintf(os.Stderr, "warning: AMDuProfPcm start failed: %v\n", startErr)
+		return nil, status
+	}
+	return proc, "running"
+}
+
+func collectRun(parent context.Context, cfg config, configName, configKey string, threads, rep int, fitOut string, fitSpill int, session *serverSession, execution runExecution, profilers runProfilers) runResult {
+	metricsCancel, metricsDone := startMetricSampler(parent, session.baseURL+"/metrics", filepath.Join(execution.runDir, "metrics.csv"))
 	start := time.Now()
-	clientExit, clientErr := runClient(parent, cfg, threads, rep, runDir)
+	clientExit, clientErr := runClient(parent, cfg, threads, rep, execution.runDir)
 	end := time.Now()
-
 	metricsCancel()
 	metrics := <-metricsDone
-	logEnd, logErr := logFileSize(session.logPath)
-	if logErr == nil {
-		logErr = copyLogRange(session.logPath, llamaLog, logStart, logEnd)
+	metrics = captureRunLogs(session.logPath, execution, metrics, start, end)
+	stopRunProfilers(cfg, profilers)
+	if clientErr != nil {
+		fmt.Fprintf(os.Stderr, "client run error: %v\n", clientErr)
 	}
-	if logErr != nil {
-		fmt.Fprintf(os.Stderr, "warning: capture server log for %s: %v\n", runDir, logErr)
+	return buildRunResult(cfg, configName, configKey, threads, rep, fitOut, fitSpill, execution, clientExit, clientErr, end.Sub(start), metrics, profilers)
+}
+
+func captureRunLogs(serverLog string, execution runExecution, metrics metricStats, start, end time.Time) metricStats {
+	logEnd, err := logFileSize(serverLog)
+	if err == nil {
+		err = copyLogRange(serverLog, execution.llamaLog, execution.logStart, logEnd)
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: capture server log for %s: %v\n", execution.runDir, err)
 	}
 	if elapsed := end.Sub(start).Seconds(); elapsed > 0 {
 		metrics.WallGenerationTPS = metrics.PredictedTokensDelta / elapsed
 		metrics.WallPromptTPS = metrics.PromptTokensDelta / elapsed
 	}
+	return metrics
+}
 
-	if uprofProc != nil {
-		uprofProc.stop(syscall.SIGINT, 5*time.Second, cfg.UProfSudo)
+func stopRunProfilers(cfg config, profilers runProfilers) {
+	if profilers.uprofProc != nil {
+		profilers.uprofProc.stop(syscall.SIGINT, 5*time.Second, cfg.UProfSudo)
 	}
-	if gpuProc != nil {
-		gpuProc.stop(syscall.SIGTERM, 3*time.Second, false)
+	if profilers.gpuProc != nil {
+		profilers.gpuProc.stop(syscall.SIGTERM, 3*time.Second, false)
 	}
-	if clientErr != nil {
-		fmt.Fprintf(os.Stderr, "client run error: %v\n", clientErr)
-	}
+}
 
-	clientLog := filepath.Join(runDir, "client.log")
+func buildRunResult(cfg config, configName, configKey string, threads, rep int, fitOut string, fitSpill int, execution runExecution, clientExit int, clientErr error, wallTime time.Duration, metrics metricStats, profilers runProfilers) runResult {
+	runDir, clientLog := execution.runDir, filepath.Join(execution.runDir, "client.log")
 	res := runResult{
-		ConfigName:     configName,
-		ConfigKey:      configKey,
-		Warmup:         rep < 0,
-		ThreadCount:    threads,
-		Repetition:     rep,
-		RunDir:         runDir,
-		ExitCode:       clientExit,
-		WallSeconds:    end.Sub(start).Seconds(),
-		Client:         parseClientLog(clientLog),
-		Llama:          parseLlamaLog(llamaLog, cfg.StarvationThreshold, cfg.LargePrefillTokens),
-		Memory:         parseMemoryLog(filepath.Join(runDir, "memory.csv")),
-		GPU:            parseGPULog(filepath.Join(runDir, "gpu.csv")),
-		Metrics:        metrics,
-		FitSpillBlocks: fitSpill,
-		FitOutput:      strings.TrimSpace(fitOut),
+		ConfigName: configName, ConfigKey: configKey, Warmup: rep < 0,
+		ThreadCount: threads, Repetition: rep, RunDir: runDir, ExitCode: clientExit,
+		WallSeconds: wallTime.Seconds(), Client: parseClientLog(clientLog),
+		Llama:  parseLlamaLog(execution.llamaLog, cfg.StarvationThreshold, cfg.LargePrefillTokens),
+		Memory: parseMemoryLog(filepath.Join(runDir, "memory.csv")),
+		GPU:    parseGPULog(filepath.Join(runDir, "gpu.csv")), Metrics: metrics,
+		FitSpillBlocks: fitSpill, FitOutput: strings.TrimSpace(fitOut),
 	}
 	if res.Client.Parsed && res.Client.ReportedSeconds == 0 {
 		res.Client.ReportedSeconds = res.WallSeconds
 	}
-	if cfg.ProfileGPU && gpuStatus == "running" {
-		gpuStatus = "unavailable: no parseable samples"
-		if res.GPU.Samples > 0 {
-			gpuStatus = "captured"
-		}
-	}
-	if cfg.ProfileMemory && memoryStatus == "running" {
-		memoryStatus = "unavailable: no parseable samples"
-		if res.Memory.Samples > 0 {
-			memoryStatus = "captured"
-		}
-	}
-	res.GPUProfiler = gpuStatus
-	res.MemoryProfiler = memoryStatus
+	res.GPUProfiler = profilerResult(cfg.ProfileGPU, profilers.gpuStatus, res.GPU.Samples)
+	res.MemoryProfiler = profilerResult(cfg.ProfileMemory, profilers.memoryStatus, res.Memory.Samples)
 	if res.ExitCode == 0 && !res.Client.Parsed {
-		res.ExitCode = 1
-		res.Error = "client benchmark result line was not parsed"
+		res.ExitCode, res.Error = 1, "client benchmark result line was not parsed"
 	} else if res.ExitCode == 0 && !res.Client.Passed {
-		res.ExitCode = 1
-		res.Error = "client benchmark reported FAIL"
+		res.ExitCode, res.Error = 1, "client benchmark reported FAIL"
 	}
 	if clientErr != nil {
 		res.Error = clientErr.Error()
@@ -1417,6 +1518,16 @@ func executeRun(parent context.Context, cfg config, configName, configKey string
 		fmt.Fprintf(os.Stderr, "write result for %s: %v\n", runDir, err)
 	}
 	return res
+}
+
+func profilerResult(enabled bool, status string, samples int) string {
+	if enabled && status == "running" {
+		status = "unavailable: no parseable samples"
+		if samples > 0 {
+			return "captured"
+		}
+	}
+	return status
 }
 
 func failedRun(configName, configKey string, threads, rep int, dir, fitOut string, fitSpill int, err error) runResult {
@@ -1454,6 +1565,10 @@ func runClient(parent context.Context, cfg config, threads, rep int, runDir stri
 	if err := cmd.Start(); err != nil {
 		return -1, err
 	}
+	return awaitClient(ctx, cmd, cfg.ClientTimeout)
+}
+
+func awaitClient(ctx context.Context, cmd *exec.Cmd, timeout time.Duration) (int, error) {
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
 
@@ -1476,7 +1591,7 @@ func runClient(parent context.Context, cfg config, threads, rep int, runDir stri
 			<-done
 		}
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return -1, fmt.Errorf("client timeout after %s", cfg.ClientTimeout)
+			return -1, fmt.Errorf("client timeout after %s", timeout)
 		}
 		return -1, ctx.Err()
 	}
@@ -1760,125 +1875,184 @@ func analyzeMetricSamples(s []metricSample) metricStats {
 	return out
 }
 
+type llamaTiming struct {
+	tokens int64
+	sec    float64
+}
+
+type llamaLogAccumulator struct {
+	prompts, evals       map[string]llamaTiming
+	tasks, active, low   map[string]bool
+	slots                map[string]bool
+	tg3, lcpSim, lcpKeep []float64
+	cancelled            int
+	maxPrefill           int64
+	maxConcurrent        int
+	largePrefillEvents   int
+	starvationEvents     int
+	starvationThreshold  float64
+	largePrefillTokens   int64
+}
+
 func parseLlamaLog(path string, starvationThreshold float64, largePrefillTokens int64) llamaStats {
 	f, err := os.Open(path)
 	if err != nil {
 		return llamaStats{}
 	}
 	defer f.Close()
-
-	type timing struct {
-		tokens int64
-		sec    float64
+	acc := newLlamaLogAccumulator(starvationThreshold, largePrefillTokens)
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	for scanner.Scan() {
+		acc.consume(scanner.Text())
 	}
-	prompts := map[string]timing{}
-	evals := map[string]timing{}
-	tasks := map[string]bool{}
-	activeTasks := map[string]bool{}
-	lowTasks := map[string]bool{}
-	slots := map[string]bool{}
-	var tg3 []float64
-	var lcpSim, lcpKeep []float64
-	var cancelled int
-	var maxPrefill int64
-	var maxConcurrent, largePrefillEvents, starvationEvents int
+	return acc.stats()
+}
 
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 64*1024), 4*1024*1024)
-	for sc.Scan() {
-		line := sc.Text()
-		if m := reLaunch.FindStringSubmatch(line); m != nil {
-			slots[m[1]] = true
-			tasks[m[2]] = true
-			activeTasks[m[2]] = true
-			maxConcurrent = max(maxConcurrent, len(activeTasks))
-		}
-		if m := rePromptEval.FindStringSubmatch(line); m != nil {
-			ms, _ := strconv.ParseFloat(m[2], 64)
-			n, _ := strconv.ParseInt(m[3], 10, 64)
-			prompts[m[1]] = timing{tokens: n, sec: ms / 1000}
-		}
-		if m := reEval.FindStringSubmatch(line); m != nil {
-			ms, _ := strconv.ParseFloat(m[2], 64)
-			n, _ := strconv.ParseInt(m[3], 10, 64)
-			evals[m[1]] = timing{tokens: n, sec: ms / 1000}
-			delete(activeTasks, m[1])
-			delete(lowTasks, m[1])
-		}
-		if m := reProgress.FindStringSubmatch(line); m != nil {
-			v, _ := strconv.ParseFloat(m[4], 64)
-			if v >= 0 {
-				tg3 = append(tg3, v)
-				if v < starvationThreshold && len(activeTasks) > 1 && !lowTasks[m[1]] {
-					starvationEvents++
-					lowTasks[m[1]] = true
-				} else if v >= starvationThreshold {
-					delete(lowTasks, m[1])
-				}
-			}
-		}
-		if m := reCancel.FindStringSubmatch(line); m != nil {
-			// llama-server cancels queued work during teardown after the client is done.
-			// Those shutdown cancellations are not workload cancellations.
-			if reStopCancel.MatchString(line) {
-				continue
-			}
-			cancelled++
-			delete(activeTasks, m[1])
-			delete(lowTasks, m[1])
-		}
-		if m := reLCP.FindStringSubmatch(line); m != nil {
-			a, _ := strconv.ParseFloat(m[1], 64)
-			b, _ := strconv.ParseFloat(m[2], 64)
-			lcpSim = append(lcpSim, a)
-			lcpKeep = append(lcpKeep, b)
-		}
-		if m := rePrefill.FindStringSubmatch(line); m != nil {
-			n, _ := strconv.ParseInt(m[2], 10, 64)
-			if n >= largePrefillTokens {
-				largePrefillEvents++
-			}
-			if n > maxPrefill {
-				maxPrefill = n
-			}
-		}
+func newLlamaLogAccumulator(starvationThreshold float64, largePrefillTokens int64) *llamaLogAccumulator {
+	return &llamaLogAccumulator{
+		prompts: make(map[string]llamaTiming), evals: make(map[string]llamaTiming),
+		tasks: make(map[string]bool), active: make(map[string]bool), low: make(map[string]bool), slots: make(map[string]bool),
+		starvationThreshold: starvationThreshold, largePrefillTokens: largePrefillTokens,
 	}
+}
 
-	var out llamaStats
-	out.TaskCount = len(tasks)
-	out.SlotsUsed = len(slots)
-	out.CancelledTasks = cancelled
-	out.MaxPromptProcessingTokens = maxPrefill
-	out.MaxConcurrentTasks = maxConcurrent
-	out.LargePrefillEvents = largePrefillEvents
-	out.DecodeStarvationEvents = starvationEvents
+func (acc *llamaLogAccumulator) consume(line string) {
+	acc.consumeLaunch(line)
+	acc.consumePrompt(line)
+	acc.consumeEval(line)
+	acc.consumeProgress(line)
+	acc.consumeCancellation(line)
+	acc.consumePrefixReuse(line)
+	acc.consumePrefill(line)
+}
 
-	for _, x := range prompts {
-		out.PromptTokens += x.tokens
-		out.PromptSeconds += x.sec
+func (acc *llamaLogAccumulator) consumeLaunch(line string) {
+	match := reLaunch.FindStringSubmatch(line)
+	if match == nil {
+		return
+	}
+	acc.slots[match[1]] = true
+	acc.tasks[match[2]] = true
+	acc.active[match[2]] = true
+	acc.maxConcurrent = max(acc.maxConcurrent, len(acc.active))
+}
+
+func (acc *llamaLogAccumulator) consumePrompt(line string) {
+	match := rePromptEval.FindStringSubmatch(line)
+	if match == nil {
+		return
+	}
+	ms, _ := strconv.ParseFloat(match[2], 64)
+	tokens, _ := strconv.ParseInt(match[3], 10, 64)
+	acc.prompts[match[1]] = llamaTiming{tokens: tokens, sec: ms / 1000}
+}
+
+func (acc *llamaLogAccumulator) consumeEval(line string) {
+	match := reEval.FindStringSubmatch(line)
+	if match == nil {
+		return
+	}
+	ms, _ := strconv.ParseFloat(match[2], 64)
+	tokens, _ := strconv.ParseInt(match[3], 10, 64)
+	acc.evals[match[1]] = llamaTiming{tokens: tokens, sec: ms / 1000}
+	delete(acc.active, match[1])
+	delete(acc.low, match[1])
+}
+
+func (acc *llamaLogAccumulator) consumeProgress(line string) {
+	match := reProgress.FindStringSubmatch(line)
+	if match == nil {
+		return
+	}
+	rate, _ := strconv.ParseFloat(match[4], 64)
+	if rate < 0 {
+		return
+	}
+	acc.tg3 = append(acc.tg3, rate)
+	if rate < acc.starvationThreshold && len(acc.active) > 1 && !acc.low[match[1]] {
+		acc.starvationEvents++
+		acc.low[match[1]] = true
+	} else if rate >= acc.starvationThreshold {
+		delete(acc.low, match[1])
+	}
+}
+
+func (acc *llamaLogAccumulator) consumeCancellation(line string) {
+	match := reCancel.FindStringSubmatch(line)
+	if match == nil || reStopCancel.MatchString(line) {
+		return
+	}
+	acc.cancelled++
+	delete(acc.active, match[1])
+	delete(acc.low, match[1])
+}
+
+func (acc *llamaLogAccumulator) consumePrefixReuse(line string) {
+	match := reLCP.FindStringSubmatch(line)
+	if match == nil {
+		return
+	}
+	similarity, _ := strconv.ParseFloat(match[1], 64)
+	keep, _ := strconv.ParseFloat(match[2], 64)
+	acc.lcpSim = append(acc.lcpSim, similarity)
+	acc.lcpKeep = append(acc.lcpKeep, keep)
+}
+
+func (acc *llamaLogAccumulator) consumePrefill(line string) {
+	match := rePrefill.FindStringSubmatch(line)
+	if match == nil {
+		return
+	}
+	tokens, _ := strconv.ParseInt(match[2], 10, 64)
+	if tokens >= acc.largePrefillTokens {
+		acc.largePrefillEvents++
+	}
+	if tokens > acc.maxPrefill {
+		acc.maxPrefill = tokens
+	}
+}
+
+func (acc *llamaLogAccumulator) stats() llamaStats {
+	out := llamaStats{
+		TaskCount: len(acc.tasks), SlotsUsed: len(acc.slots), CancelledTasks: acc.cancelled,
+		MaxPromptProcessingTokens: acc.maxPrefill, MaxConcurrentTasks: acc.maxConcurrent,
+		LargePrefillEvents: acc.largePrefillEvents, DecodeStarvationEvents: acc.starvationEvents,
+	}
+	for _, timing := range acc.prompts {
+		out.PromptTokens += timing.tokens
+		out.PromptSeconds += timing.sec
 	}
 	if out.PromptSeconds > 0 {
 		out.PromptTPSWeighted = float64(out.PromptTokens) / out.PromptSeconds
 	}
-	for _, x := range evals {
-		out.GeneratedTokens += x.tokens
-		out.EvalSecondsSummed += x.sec
+	for _, timing := range acc.evals {
+		out.GeneratedTokens += timing.tokens
+		out.EvalSecondsSummed += timing.sec
 	}
 	if out.EvalSecondsSummed > 0 {
 		out.TaskTGWeighted = float64(out.GeneratedTokens) / out.EvalSecondsSummed
 	}
-	if len(tg3) > 0 {
-		st := statsOf(tg3)
-		out.MinTG3s = st.Min
-		out.MaxTG3s = st.Max
-		out.MeanTG3s = st.Mean
-	}
-	if len(lcpSim) > 0 {
-		out.LCPCount = len(lcpSim)
-		out.MeanLCPSimilarity = statsOf(lcpSim).Mean
-		out.MeanLCPKeep = statsOf(lcpKeep).Mean
-	}
+	setLlamaDecodeStats(&out, acc.tg3)
+	setLlamaPrefixStats(&out, acc.lcpSim, acc.lcpKeep)
 	return out
+}
+
+func setLlamaDecodeStats(out *llamaStats, values []float64) {
+	if len(values) == 0 {
+		return
+	}
+	stats := statsOf(values)
+	out.MinTG3s, out.MaxTG3s, out.MeanTG3s = stats.Min, stats.Max, stats.Mean
+}
+
+func setLlamaPrefixStats(out *llamaStats, similarities, keep []float64) {
+	if len(similarities) == 0 {
+		return
+	}
+	out.LCPCount = len(similarities)
+	out.MeanLCPSimilarity = statsOf(similarities).Mean
+	out.MeanLCPKeep = statsOf(keep).Mean
 }
 
 func parseMemoryLog(path string) memoryStats {
@@ -1887,69 +2061,68 @@ func parseMemoryLog(path string) memoryStats {
 		return memoryStats{}
 	}
 	defer f.Close()
+	parser := memoryLogParser{totalIdx: -1, readIdx: -1, writeIdx: -1}
+	scanLogLines(f, parser.consumeLine)
+	return parser.stats()
+}
 
-	var total, read, write []float64
-	sc := bufio.NewScanner(f)
-	headerFound := false
-	totalIdx, readIdx, writeIdx := -1, -1, -1
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" {
-			continue
-		}
-		rec, err := csv.NewReader(strings.NewReader(line)).Read()
-		if err != nil {
-			continue
-		}
-		if !headerFound {
-			for i, field := range rec {
-				n := normalizeHeader(field)
-				// Use the first system-level occurrence. With -A system,package the
-				// same three names occur twice; the first set is the system aggregate.
-				switch n {
-				case "TOTAL_MEM_BW_GB_S":
-					if totalIdx < 0 {
-						totalIdx = i
-					}
-				case "TOTAL_MEM_RDBW_GB_S":
-					if readIdx < 0 {
-						readIdx = i
-					}
-				case "TOTAL_MEM_WRBW_GB_S":
-					if writeIdx < 0 {
-						writeIdx = i
-					}
-				}
-			}
-			if totalIdx >= 0 && readIdx >= 0 && writeIdx >= 0 {
-				headerFound = true
-			}
-			continue
-		}
-		maxIdx := totalIdx
-		if readIdx > maxIdx {
-			maxIdx = readIdx
-		}
-		if writeIdx > maxIdx {
-			maxIdx = writeIdx
-		}
-		if len(rec) <= maxIdx {
-			continue
-		}
-		a, e1 := strconv.ParseFloat(strings.TrimSpace(rec[totalIdx]), 64)
-		b, e2 := strconv.ParseFloat(strings.TrimSpace(rec[readIdx]), 64)
-		c, e3 := strconv.ParseFloat(strings.TrimSpace(rec[writeIdx]), 64)
-		if e1 != nil || e2 != nil || e3 != nil {
-			continue
-		}
-		total = append(total, a)
-		read = append(read, b)
-		write = append(write, c)
+type memoryLogParser struct {
+	totalIdx, readIdx, writeIdx int
+	headerFound                 bool
+	total, read, write          []float64
+}
+
+func (p *memoryLogParser) consumeLine(line string) {
+	record, err := csv.NewReader(strings.NewReader(strings.TrimSpace(line))).Read()
+	if err != nil || len(record) == 0 {
+		return
 	}
-	ts, rs, ws := statsOf(total), statsOf(read), statsOf(write)
+	if !p.headerFound {
+		p.readHeader(record)
+		return
+	}
+	p.readSample(record)
+}
+
+func (p *memoryLogParser) readHeader(record []string) {
+	for i, field := range record {
+		switch normalizeHeader(field) {
+		case "TOTAL_MEM_BW_GB_S":
+			if p.totalIdx < 0 {
+				p.totalIdx = i
+			}
+		case "TOTAL_MEM_RDBW_GB_S":
+			if p.readIdx < 0 {
+				p.readIdx = i
+			}
+		case "TOTAL_MEM_WRBW_GB_S":
+			if p.writeIdx < 0 {
+				p.writeIdx = i
+			}
+		}
+	}
+	p.headerFound = p.totalIdx >= 0 && p.readIdx >= 0 && p.writeIdx >= 0
+}
+
+func (p *memoryLogParser) readSample(record []string) {
+	maxIdx := max(p.totalIdx, p.readIdx, p.writeIdx)
+	if len(record) <= maxIdx {
+		return
+	}
+	total, e1 := strconv.ParseFloat(strings.TrimSpace(record[p.totalIdx]), 64)
+	read, e2 := strconv.ParseFloat(strings.TrimSpace(record[p.readIdx]), 64)
+	write, e3 := strconv.ParseFloat(strings.TrimSpace(record[p.writeIdx]), 64)
+	if e1 != nil || e2 != nil || e3 != nil {
+		return
+	}
+	p.total, p.read, p.write = append(p.total, total), append(p.read, read), append(p.write, write)
+}
+
+func (p *memoryLogParser) stats() memoryStats {
+	ts, rs, ws := statsOf(p.total), statsOf(p.read), statsOf(p.write)
 	return memoryStats{
-		ReadValues: append([]float64(nil), read...),
-		Samples:    len(total), MeanTotal: ts.Mean, MaxTotal: ts.Max,
+		ReadValues: append([]float64(nil), p.read...),
+		Samples:    len(p.total), MeanTotal: ts.Mean, MaxTotal: ts.Max,
 		MeanRead: rs.Mean, MaxRead: rs.Max, MeanWrite: ws.Mean, MaxWrite: ws.Max,
 		MedianTotal: ts.Median, MedianRead: rs.Median, MedianWrite: ws.Median,
 		P95Total: ts.P95, P95Read: rs.P95, P95Write: ws.P95,
@@ -1962,70 +2135,81 @@ func parseGPULog(path string) gpuStats {
 		return gpuStats{}
 	}
 	defer f.Close()
+	parser := gpuLogParser{index: map[string]int{}}
+	scanLogLines(f, parser.consumeLine)
+	return parser.stats()
+}
 
-	var util, memUtil, power, vram []float64
-	sc := bufio.NewScanner(f)
-	var header []string
-	index := map[string]int{}
-
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" || strings.HasPrefix(line, "WARNING") {
-			continue
-		}
-		rec, err := csv.NewReader(strings.NewReader(line)).Read()
-		if err != nil || len(rec) < 2 {
-			continue
-		}
-		if header == nil {
-			hasGPU := false
-			for _, x := range rec {
-				u := normalizeHeader(x)
-				if u == "GPU" {
-					hasGPU = true
-				}
-			}
-			if !hasGPU {
-				continue
-			}
-			header = rec
-			for i, x := range header {
-				index[normalizeHeader(x)] = i
-			}
-			continue
-		}
-
-		if i := findHeaderIndex(index, "GFX_UTIL", "GFX%", "GFXUTIL", "GFX", "GFX_ACTIVITY", "GPU_UTIL", "GPU_UTILIZATION", "GPU%"); i >= 0 && i < len(rec) {
-			if v, ok := parseNumber(rec[i]); ok {
-				util = append(util, v)
-			}
-		}
-		if i := findHeaderIndex(index, "MEM_UTIL", "MEM%", "MEMUTIL", "MEM_ACTIVITY", "MEM"); i >= 0 && i < len(rec) {
-			if v, ok := parseNumber(rec[i]); ok {
-				memUtil = append(memUtil, v)
-			}
-		}
-		if i := findHeaderContains(index, "POWER"); i >= 0 && i < len(rec) {
-			if v, ok := parseNumber(rec[i]); ok {
-				power = append(power, v)
-			}
-		}
-		if i := findHeaderIndex(index, "VRAM_USED", "VRAM_USED_MB", "VRAM_USAGE", "VRAM_USAGE_MB"); i >= 0 && i < len(rec) {
-			field := rec[i]
-			if strings.Contains(field, "/") {
-				field = strings.SplitN(field, "/", 2)[0]
-			}
-			if v, ok := parseNumber(field); ok {
-				// amd-smi monitor normally reports MB for discrete GPUs.
-				vram = append(vram, v)
-			}
+func scanLogLines(r io.Reader, consume func(string)) {
+	scanner := bufio.NewScanner(r)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line != "" {
+			consume(line)
 		}
 	}
+}
 
-	us, mus, ps, vs := statsOf(util), statsOf(memUtil), statsOf(power), statsOf(vram)
+type gpuLogParser struct {
+	header                     []string
+	index                      map[string]int
+	util, memUtil, power, vram []float64
+}
+
+func (p *gpuLogParser) consumeLine(line string) {
+	if strings.HasPrefix(line, "WARNING") {
+		return
+	}
+	record, err := csv.NewReader(strings.NewReader(line)).Read()
+	if err != nil || len(record) < 2 {
+		return
+	}
+	if p.header == nil {
+		p.readHeader(record)
+		return
+	}
+	p.readSample(record)
+}
+
+func (p *gpuLogParser) readHeader(record []string) {
+	for _, field := range record {
+		if normalizeHeader(field) == "GPU" {
+			p.header = record
+			break
+		}
+	}
+	for i, field := range p.header {
+		p.index[normalizeHeader(field)] = i
+	}
+}
+
+func (p *gpuLogParser) appendField(record []string, index int, values *[]float64) {
+	if index < 0 || index >= len(record) {
+		return
+	}
+	if value, ok := parseNumber(record[index]); ok {
+		*values = append(*values, value)
+	}
+}
+
+func (p *gpuLogParser) readSample(record []string) {
+	p.appendField(record, findHeaderIndex(p.index, "GFX_UTIL", "GFX%", "GFXUTIL", "GFX", "GFX_ACTIVITY", "GPU_UTIL", "GPU_UTILIZATION", "GPU%"), &p.util)
+	p.appendField(record, findHeaderIndex(p.index, "MEM_UTIL", "MEM%", "MEMUTIL", "MEM_ACTIVITY", "MEM"), &p.memUtil)
+	p.appendField(record, findHeaderContains(p.index, "POWER"), &p.power)
+	index := findHeaderIndex(p.index, "VRAM_USED", "VRAM_USED_MB", "VRAM_USAGE", "VRAM_USAGE_MB")
+	if index >= 0 && index < len(record) {
+		field := strings.SplitN(record[index], "/", 2)[0]
+		if value, ok := parseNumber(field); ok {
+			p.vram = append(p.vram, value)
+		}
+	}
+}
+
+func (p *gpuLogParser) stats() gpuStats {
+	us, mus, ps, vs := statsOf(p.util), statsOf(p.memUtil), statsOf(p.power), statsOf(p.vram)
 	return gpuStats{
-		UtilValues: append([]float64(nil), util...), PowerValues: append([]float64(nil), power...),
-		Samples: max(len(util), len(memUtil), len(power), len(vram)), MeanUtil: us.Mean, MaxUtil: us.Max,
+		UtilValues: append([]float64(nil), p.util...), PowerValues: append([]float64(nil), p.power...),
+		Samples: max(len(p.util), len(p.memUtil), len(p.power), len(p.vram)), MeanUtil: us.Mean, MaxUtil: us.Max,
 		MeanMemUtil: mus.Mean, MaxMemUtil: mus.Max,
 		MedianMemUtil: mus.Median, P95MemUtil: mus.P95,
 		MeanPower: ps.Mean, MaxPower: ps.Max, MedianPower: ps.Median, P95Power: ps.P95,
@@ -2239,94 +2423,11 @@ type aggregate struct {
 }
 
 func aggregateResults(results []runResult) []aggregate {
-	by := map[string][]runResult{}
-	for _, r := range results {
-		key := fmt.Sprintf("%s|%d", r.ConfigKey, r.ThreadCount)
-		by[key] = append(by[key], r)
-	}
-	var keys []string
-	for k := range by {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	var out []aggregate
-	for _, k := range keys {
-		rs := by[k]
-		var wall, client, taskTG, metricTG, pp, mem, gpu, power, cancelled, starvation []float64
-		var memRaw, gpuRaw, powerRaw []float64
-		success := 0
-		spill := 0
-		totalCancelled := 0
-		for _, r := range rs {
-			totalCancelled += r.Llama.CancelledTasks
-			if r.FitSpillBlocks > spill {
-				spill = r.FitSpillBlocks
-			}
-			if r.ExitCode != 0 {
-				continue
-			}
-			success++
-			wall = append(wall, r.WallSeconds)
-			if r.Client.ReportedSeconds > 0 {
-				client = append(client, r.Client.ReportedSeconds)
-			}
-			if r.Llama.TaskTGWeighted > 0 {
-				taskTG = append(taskTG, r.Llama.TaskTGWeighted)
-			}
-			if r.Metrics.WallGenerationTPS > 0 {
-				metricTG = append(metricTG, r.Metrics.WallGenerationTPS)
-			}
-			if r.Llama.PromptTPSWeighted > 0 {
-				pp = append(pp, r.Llama.PromptTPSWeighted)
-			}
-			if r.Memory.MeanRead > 0 {
-				mem = append(mem, r.Memory.MeanRead)
-				memRaw = append(memRaw, r.Memory.ReadValues...)
-			}
-			gpuStats := r.GPU
-			// Sample slices are excluded from result.json to keep the files small.
-			// Rehydrate them from the raw telemetry when a resumed run is summarized.
-			if gpuStats.Samples > 0 && len(gpuStats.UtilValues) == 0 && len(gpuStats.PowerValues) == 0 {
-				gpuStats = parseGPULog(filepath.Join(r.RunDir, "gpu.csv"))
-			}
-			if gpuStats.Samples > 0 {
-				if gpuStats.MeanUtil > 0 {
-					gpu = append(gpu, gpuStats.MeanUtil)
-				}
-				gpuRaw = append(gpuRaw, gpuStats.UtilValues...)
-			}
-			if gpuStats.Samples > 0 && gpuStats.MeanPower > 0 {
-				power = append(power, gpuStats.MeanPower)
-				powerRaw = append(powerRaw, gpuStats.PowerValues...)
-			}
-			cancelled = append(cancelled, float64(r.Llama.CancelledTasks))
-			starvation = append(starvation, float64(r.Llama.DecodeStarvationEvents))
-		}
-		ws := statsOf(wall)
-		memSamples, gpuSamples, powerSamples := statsOf(memRaw), statsOf(gpuRaw), statsOf(powerRaw)
-		out = append(out, aggregate{
-			ConfigName: rs[0].ConfigName, ConfigKey: rs[0].ConfigKey,
-			Threads: rs[0].ThreadCount, Runs: len(rs), Success: success,
-			MeanWall: ws.Mean, MedianWall: ws.Median, P95Wall: ws.P95, MinWall: ws.Min, MaxWall: ws.Max,
-			MedianClient:     statsOf(client).Median,
-			MedianTaskTG:     statsOf(taskTG).Median,
-			MedianMetricTG:   statsOf(metricTG).Median,
-			MedianPromptTPS:  statsOf(pp).Median,
-			MedianMemRead:    statsOf(mem).Median,
-			P95MemRead:       memSamples.P95,
-			MaxMemRead:       memSamples.Max,
-			MedianGPUUtil:    statsOf(gpu).Median,
-			P95GPUUtil:       gpuSamples.P95,
-			MaxGPUUtil:       gpuSamples.Max,
-			MedianPower:      statsOf(power).Median,
-			P95Power:         powerSamples.P95,
-			MaxPower:         powerSamples.Max,
-			MedianCancelled:  statsOf(cancelled).Median,
-			MedianStarvation: statsOf(starvation).Median,
-			TotalCancelled:   totalCancelled,
-			SpillBlocks:      spill,
-		})
+	groups := groupResultsByConfigThread(results)
+	keys := sortedKeys(groups)
+	out := make([]aggregate, 0, len(keys))
+	for _, key := range keys {
+		out = append(out, aggregateRunGroup(groups[key]))
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Success == 0 || out[j].Success == 0 {
@@ -2341,6 +2442,103 @@ func aggregateResults(results []runResult) []aggregate {
 		return out[i].Threads < out[j].Threads
 	})
 	return out
+}
+
+func groupResultsByConfigThread(results []runResult) map[string][]runResult {
+	groups := make(map[string][]runResult)
+	for _, result := range results {
+		key := fmt.Sprintf("%s|%d", result.ConfigKey, result.ThreadCount)
+		groups[key] = append(groups[key], result)
+	}
+	return groups
+}
+
+func sortedKeys(groups map[string][]runResult) []string {
+	keys := make([]string, 0, len(groups))
+	for key := range groups {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+type aggregateSamples struct {
+	wall, client, taskTG, metricTG []float64
+	prompt, memory, gpu, power     []float64
+	memoryRaw, gpuRaw, powerRaw    []float64
+	cancelled, starvation          []float64
+	success, spill, totalCancelled int
+}
+
+func aggregateRunGroup(runs []runResult) aggregate {
+	samples := aggregateSamples{}
+	for _, run := range runs {
+		samples.add(run)
+	}
+	return samples.result(runs)
+}
+
+func (samples *aggregateSamples) add(run runResult) {
+	samples.totalCancelled += run.Llama.CancelledTasks
+	samples.spill = max(samples.spill, run.FitSpillBlocks)
+	if run.ExitCode != 0 {
+		return
+	}
+	samples.success++
+	samples.wall = append(samples.wall, run.WallSeconds)
+	appendPositive(&samples.client, run.Client.ReportedSeconds)
+	appendPositive(&samples.taskTG, run.Llama.TaskTGWeighted)
+	appendPositive(&samples.metricTG, run.Metrics.WallGenerationTPS)
+	appendPositive(&samples.prompt, run.Llama.PromptTPSWeighted)
+	if run.Memory.MeanRead > 0 {
+		samples.memory = append(samples.memory, run.Memory.MeanRead)
+		samples.memoryRaw = append(samples.memoryRaw, run.Memory.ReadValues...)
+	}
+	samples.addGPU(run)
+	samples.cancelled = append(samples.cancelled, float64(run.Llama.CancelledTasks))
+	samples.starvation = append(samples.starvation, float64(run.Llama.DecodeStarvationEvents))
+}
+
+func appendPositive(values *[]float64, value float64) {
+	if value > 0 {
+		*values = append(*values, value)
+	}
+}
+
+func (samples *aggregateSamples) addGPU(run runResult) {
+	gpu := run.GPU
+	// Raw samples are omitted from result.json and reloaded on resume.
+	if gpu.Samples > 0 && len(gpu.UtilValues) == 0 && len(gpu.PowerValues) == 0 {
+		gpu = parseGPULog(filepath.Join(run.RunDir, "gpu.csv"))
+	}
+	if gpu.Samples == 0 {
+		return
+	}
+	appendPositive(&samples.gpu, gpu.MeanUtil)
+	samples.gpuRaw = append(samples.gpuRaw, gpu.UtilValues...)
+	if gpu.MeanPower > 0 {
+		samples.power = append(samples.power, gpu.MeanPower)
+		samples.powerRaw = append(samples.powerRaw, gpu.PowerValues...)
+	}
+}
+
+func (samples aggregateSamples) result(runs []runResult) aggregate {
+	wallStats := statsOf(samples.wall)
+	memoryStats, gpuStats, powerStats := statsOf(samples.memoryRaw), statsOf(samples.gpuRaw), statsOf(samples.powerRaw)
+	first := runs[0]
+	return aggregate{
+		ConfigName: first.ConfigName, ConfigKey: first.ConfigKey, Threads: first.ThreadCount,
+		Runs: len(runs), Success: samples.success,
+		MeanWall: wallStats.Mean, MedianWall: wallStats.Median, P95Wall: wallStats.P95,
+		MinWall: wallStats.Min, MaxWall: wallStats.Max,
+		MedianClient: statsOf(samples.client).Median, MedianTaskTG: statsOf(samples.taskTG).Median,
+		MedianMetricTG: statsOf(samples.metricTG).Median, MedianPromptTPS: statsOf(samples.prompt).Median,
+		MedianMemRead: statsOf(samples.memory).Median, P95MemRead: memoryStats.P95, MaxMemRead: memoryStats.Max,
+		MedianGPUUtil: statsOf(samples.gpu).Median, P95GPUUtil: gpuStats.P95, MaxGPUUtil: gpuStats.Max,
+		MedianPower: statsOf(samples.power).Median, P95Power: powerStats.P95, MaxPower: powerStats.Max,
+		MedianCancelled: statsOf(samples.cancelled).Median, MedianStarvation: statsOf(samples.starvation).Median,
+		TotalCancelled: samples.totalCancelled, SpillBlocks: samples.spill,
+	}
 }
 
 func writeSummaryCSV(path string, results []runResult) error {

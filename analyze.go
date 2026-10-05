@@ -119,6 +119,22 @@ func groupIdentity(result runResult) (label, identity, preserveKey string, prese
 // the benchmark. Directories are accepted as shorthand for directories that
 // contain runs.csv.
 func runAnalysisCommand(args []string, stdout io.Writer) error {
+	options, inputs, err := parseAnalysisOptions(args, stdout)
+	if err != nil {
+		return err
+	}
+	return writeAnalysisCommand(options, inputs, stdout)
+}
+
+type analysisOptions struct {
+	output         string
+	minRuns        int
+	expectedCells  int
+	matrixManifest string
+	coveragePlan   string
+}
+
+func parseAnalysisOptions(args []string, stdout io.Writer) (analysisOptions, []string, error) {
 	fs := flag.NewFlagSet("analyze", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	output := fs.String("out", "", "write the Markdown report to this file instead of stdout")
@@ -131,63 +147,73 @@ func runAnalysisCommand(args []string, stdout io.Writer) error {
 			fmt.Fprintln(stdout, "Usage: llama-bench-harness analyze [--out report.md] [--min-runs N] [--expected-cells N] [--matrix-manifest matrix.json] <runs.csv-or-output-dir>...")
 			fs.SetOutput(stdout)
 			fs.PrintDefaults()
-			return nil
+			return analysisOptions{}, nil, nil
 		}
-		return err
+		return analysisOptions{}, nil, err
 	}
 	if *minRuns < 1 {
-		return errors.New("--min-runs must be at least 1")
+		return analysisOptions{}, nil, errors.New("--min-runs must be at least 1")
 	}
 	if *expectedCells < 0 {
-		return errors.New("--expected-cells cannot be negative")
+		return analysisOptions{}, nil, errors.New("--expected-cells cannot be negative")
 	}
 	inputs := fs.Args()
 	if len(inputs) == 0 {
-		return errors.New("usage: llama-bench-harness analyze [--out report.md] [--min-runs N] [--expected-cells N] [--matrix-manifest matrix.json] <runs.csv-or-output-dir>...")
+		return analysisOptions{}, nil, errors.New("usage: llama-bench-harness analyze [--out report.md] [--min-runs N] [--expected-cells N] [--matrix-manifest matrix.json] <runs.csv-or-output-dir>...")
 	}
+	return analysisOptions{*output, *minRuns, *expectedCells, *matrixManifest, *coveragePlan}, inputs, nil
+}
 
+func writeAnalysisCommand(options analysisOptions, inputs []string, stdout io.Writer) error {
+	if inputs == nil {
+		return nil
+	}
 	results, err := readAnalysisInputs(inputs)
 	if err != nil {
 		return err
 	}
-	report := renderAnalysisReport(results, *minRuns)
-	if *expectedCells > 0 {
-		if err := validateAnalysisCoverage(results, *expectedCells, *minRuns); err != nil {
+	report := renderAnalysisReport(results, options.minRuns)
+	if options.expectedCells > 0 {
+		if err := validateAnalysisCoverage(results, options.expectedCells, options.minRuns); err != nil {
 			return err
 		}
-		report = strings.TrimRight(report, "\n") + fmt.Sprintf("\n\n## Completeness audit\n\nPASS: all %d expected configuration/thread cells have at least %d successful counted runs.\n", *expectedCells, *minRuns)
+		report = strings.TrimRight(report, "\n") + fmt.Sprintf("\n\n## Completeness audit\n\nPASS: all %d expected configuration/thread cells have at least %d successful counted runs.\n", options.expectedCells, options.minRuns)
 	}
-	if *matrixManifest != "" {
-		manifest, err := readAnalysisMatrixManifest(*matrixManifest)
+	if options.matrixManifest != "" {
+		manifest, err := readAnalysisMatrixManifest(options.matrixManifest)
 		if err != nil {
 			return err
 		}
-		if err := validateAnalysisMatrix(results, manifest, *minRuns); err != nil {
+		if err := validateAnalysisMatrix(results, manifest, options.minRuns); err != nil {
 			return err
 		}
-		report = strings.TrimRight(report, "\n") + fmt.Sprintf("\n\n## Exact matrix audit\n\nPASS: all expected Cartesian cells across %d threads have at least %d successful counted runs.\n", len(manifest.Threads), *minRuns)
+		report = strings.TrimRight(report, "\n") + fmt.Sprintf("\n\n## Exact matrix audit\n\nPASS: all expected Cartesian cells across %d threads have at least %d successful counted runs.\n", len(manifest.Threads), options.minRuns)
 	}
-	if *coveragePlan != "" {
-		plan, err := readCoveragePlan(*coveragePlan)
+	if options.coveragePlan != "" {
+		plan, err := readCoveragePlan(options.coveragePlan)
 		if err != nil {
 			return err
 		}
-		if err := validateCoveragePlan(results, plan, *minRuns); err != nil {
+		if err := validateCoveragePlan(results, plan, options.minRuns); err != nil {
 			return err
 		}
-		report = strings.TrimRight(report, "\n") + fmt.Sprintf("\n\n## Pairwise coverage audit\n\nPASS: all %d planned setting/thread cells have at least %d successful counted runs.\n", len(plan), *minRuns)
+		report = strings.TrimRight(report, "\n") + fmt.Sprintf("\n\n## Pairwise coverage audit\n\nPASS: all %d planned setting/thread cells have at least %d successful counted runs.\n", len(plan), options.minRuns)
 	}
-	if *output == "" || *output == "-" {
-		_, err = io.WriteString(stdout, report)
+	return writeAnalysisReport(report, options.output, stdout)
+}
+
+func writeAnalysisReport(report, output string, stdout io.Writer) error {
+	if output == "" || output == "-" {
+		_, err := io.WriteString(stdout, report)
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(*output), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(output), 0o755); err != nil {
 		return fmt.Errorf("create report directory: %w", err)
 	}
-	if err := os.WriteFile(*output, []byte(report), 0o644); err != nil {
+	if err := os.WriteFile(output, []byte(report), 0o644); err != nil {
 		return fmt.Errorf("write report: %w", err)
 	}
-	_, err = fmt.Fprintf(stdout, "Analysis report: %s\n", *output)
+	_, err := fmt.Fprintf(stdout, "Analysis report: %s\n", output)
 	return err
 }
 
@@ -261,6 +287,22 @@ func readAnalysisMatrixManifest(path string) (analysisMatrixManifest, error) {
 }
 
 func validateAnalysisMatrix(results []runResult, manifest analysisMatrixManifest, minRuns int) error {
+	configs, err := expandManifestAxes(manifestMatrixAxes(manifest))
+	if err != nil {
+		return err
+	}
+	expected, err := expectedMatrixCells(configs, manifest.Threads)
+	if err != nil {
+		return err
+	}
+	observed, err := observedMatrixCells(results)
+	if err != nil {
+		return err
+	}
+	return auditMatrixCells(expected, observed, minRuns)
+}
+
+func manifestMatrixAxes(manifest analysisMatrixManifest) []analysisMatrixAxis {
 	stringValues := func(values []string) []string { return values }
 	intValues := func(values []int) []string {
 		out := make([]string, len(values))
@@ -291,15 +333,19 @@ func validateAnalysisMatrix(results []runResult, manifest analysisMatrixManifest
 		{name: "kv_v", values: stringValues(manifest.KVV), apply: func(s *analysisSettings, v string) { s.KVV = v }},
 		{name: "preserve_thinking", values: boolValues(manifest.PreserveThinking), apply: func(s *analysisSettings, v string) { s.PreserveThinking, _ = strconv.ParseBool(v) }},
 	}
+	return axes
+}
+
+func expandManifestAxes(axes []analysisMatrixAxis) ([]analysisSettings, error) {
 	configs := []analysisSettings{{}}
 	for _, axis := range axes {
 		if len(axis.values) == 0 {
-			return fmt.Errorf("matrix manifest: axis %s has no values", axis.name)
+			return nil, fmt.Errorf("matrix manifest: axis %s has no values", axis.name)
 		}
 		seen := make(map[string]bool, len(axis.values))
 		for _, value := range axis.values {
 			if seen[value] {
-				return fmt.Errorf("matrix manifest: axis %s repeats value %q", axis.name, value)
+				return nil, fmt.Errorf("matrix manifest: axis %s repeats value %q", axis.name, value)
 			}
 			seen[value] = true
 		}
@@ -313,25 +359,33 @@ func validateAnalysisMatrix(results []runResult, manifest analysisMatrixManifest
 		}
 		configs = next
 	}
-	if len(manifest.Threads) == 0 {
-		return errors.New("matrix manifest: threads has no values")
+	return configs, nil
+}
+
+func expectedMatrixCells(configs []analysisSettings, threads []int) (map[string]bool, error) {
+	if len(threads) == 0 {
+		return nil, errors.New("matrix manifest: threads has no values")
 	}
-	threadSeen := make(map[int]bool, len(manifest.Threads))
-	expected := make(map[string]bool, len(configs)*len(manifest.Threads))
-	for _, thread := range manifest.Threads {
+	threadSeen := make(map[int]bool, len(threads))
+	expected := make(map[string]bool, len(configs)*len(threads))
+	for _, thread := range threads {
 		if threadSeen[thread] {
-			return fmt.Errorf("matrix manifest: threads repeats value %d", thread)
+			return nil, fmt.Errorf("matrix manifest: threads repeats value %d", thread)
 		}
 		threadSeen[thread] = true
 		for _, config := range configs {
 			expected[fmt.Sprintf("%s|%d", config.key(true), thread)] = true
 		}
 	}
+	return expected, nil
+}
+
+func observedMatrixCells(results []runResult) (map[string]*analysisGroup, error) {
 	observed := make(map[string]*analysisGroup)
 	for _, result := range results {
 		settings, ok := readAnalysisSettings(result.RunDir)
 		if !ok {
-			return fmt.Errorf("matrix audit: configuration metadata missing for %s", result.RunDir)
+			return nil, fmt.Errorf("matrix audit: configuration metadata missing for %s", result.RunDir)
 		}
 		key := fmt.Sprintf("%s|%d", settings.key(true), result.ThreadCount)
 		group := observed[key]
@@ -341,6 +395,10 @@ func validateAnalysisMatrix(results []runResult, manifest analysisMatrixManifest
 		}
 		group.runs = append(group.runs, result)
 	}
+	return observed, nil
+}
+
+func auditMatrixCells(expected map[string]bool, observed map[string]*analysisGroup, minRuns int) error {
 	var missing, unexpected, underSampled []string
 	for key := range expected {
 		group := observed[key]
@@ -469,98 +527,145 @@ func readRunsCSV(path string) ([]runResult, error) {
 		if len(row) == 1 && strings.TrimSpace(row[0]) == "" {
 			continue
 		}
-		value := func(name string) string {
-			i, ok := columns[name]
-			if !ok || i >= len(row) {
-				return ""
-			}
-			return strings.TrimSpace(row[i])
-		}
-		parseInt := func(name string) (int, error) {
-			s := value(name)
-			if s == "" {
-				return 0, nil
-			}
-			n, parseErr := strconv.Atoi(s)
-			if parseErr != nil {
-				return 0, fmt.Errorf("line %d column %s: %w", line, name, parseErr)
-			}
-			return n, nil
-		}
-		parseFloat := func(name string) (float64, error) {
-			s := value(name)
-			if s == "" {
-				return 0, nil
-			}
-			n, parseErr := strconv.ParseFloat(s, 64)
-			if parseErr != nil {
-				return 0, fmt.Errorf("line %d column %s: %w", line, name, parseErr)
-			}
-			return n, nil
-		}
-		var result runResult
-		result.ConfigName = value("configuration")
-		result.ConfigKey = result.ConfigName
-		result.RunDir = value("run_dir")
-		result.Error = value("error")
-		intFields := []struct {
-			name string
-			to   *int
-		}{
-			{"threads", &result.ThreadCount}, {"run", &result.Repetition}, {"exit_code", &result.ExitCode},
-			{"client_prompt_tokens", &result.Client.PromptTokens}, {"client_reasoning_tokens", &result.Client.ReasoningTokens},
-			{"turns", &result.Client.Turns}, {"out_tokens", &result.Client.OutTokens},
-			{"tasks", &result.Llama.TaskCount}, {"slots_used", &result.Llama.SlotsUsed},
-			{"cancelled_tasks", &result.Llama.CancelledTasks}, {"max_concurrent_tasks", &result.Llama.MaxConcurrentTasks},
-			{"large_prefill_events", &result.Llama.LargePrefillEvents}, {"decode_starvation_events", &result.Llama.DecodeStarvationEvents},
-			{"fit_spill_blocks", &result.FitSpillBlocks},
-		}
-		for _, field := range intFields {
-			*field.to, err = parseInt(field.name)
-			if err != nil {
-				return nil, err
-			}
-		}
-		floatFields := []struct {
-			name string
-			to   *float64
-		}{
-			{"wall_s", &result.WallSeconds}, {"client_reported_s", &result.Client.ReportedSeconds},
-			{"prompt_s", &result.Llama.PromptSeconds}, {"prompt_tps", &result.Llama.PromptTPSWeighted},
-			{"summed_eval_s", &result.Llama.EvalSecondsSummed}, {"task_tg_weighted", &result.Llama.TaskTGWeighted},
-			{"min_tg3s", &result.Llama.MinTG3s}, {"metrics_wall_gen_tps", &result.Metrics.WallGenerationTPS},
-			{"max_requests_processing", &result.Metrics.MaxRequestsProcessing},
-			{"max_requests_deferred", &result.Metrics.MaxRequestsDeferred}, {"max_context", &result.Metrics.MaxContextObserved},
-			{"mem_mean_read_gbs", &result.Memory.MeanRead}, {"mem_max_read_gbs", &result.Memory.MaxRead},
-			{"mem_mean_write_gbs", &result.Memory.MeanWrite}, {"gpu_mean_util_pct", &result.GPU.MeanUtil},
-			{"gpu_max_util_pct", &result.GPU.MaxUtil}, {"gpu_mean_power_w", &result.GPU.MeanPower},
-			{"gpu_max_power_w", &result.GPU.MaxPower},
-		}
-		for _, field := range floatFields {
-			*field.to, err = parseFloat(field.name)
-			if err != nil {
-				return nil, err
-			}
-			if math.IsNaN(*field.to) || math.IsInf(*field.to, 0) {
-				return nil, fmt.Errorf("line %d column %s: non-finite value", line, field.name)
-			}
-		}
-		if promptTokens, parseErr := strconv.ParseInt(value("prompt_tokens"), 10, 64); parseErr == nil {
-			result.Llama.PromptTokens = promptTokens
-		} else if value("prompt_tokens") != "" {
-			return nil, fmt.Errorf("line %d column prompt_tokens: %w", line, parseErr)
-		}
-		if generatedTokens, parseErr := strconv.ParseInt(value("generated_tokens"), 10, 64); parseErr == nil {
-			result.Llama.GeneratedTokens = generatedTokens
-		} else if value("generated_tokens") != "" {
-			return nil, fmt.Errorf("line %d column generated_tokens: %w", line, parseErr)
+		result, err := parseRunsCSVRow(row, columns, line)
+		if err != nil {
+			return nil, err
 		}
 		results = append(results, result)
 	}
 	return results, nil
 }
 
+func parseRunsCSVRow(row []string, columns map[string]int, line int) (runResult, error) {
+	value := func(name string) string { return csvValue(row, columns, name) }
+	parseInt := func(name string) (int, error) { return parseCSVInt(value(name), name, line) }
+	parseFloat := func(name string) (float64, error) { return parseCSVFloat(value(name), name, line) }
+	result := runResult{ConfigName: value("configuration"), RunDir: value("run_dir"), Error: value("error")}
+	result.ConfigKey = result.ConfigName
+	if err := parseCSVNumberFields(&result, parseInt, parseFloat); err != nil {
+		return runResult{}, err
+	}
+	if err := parseCSVTokenFields(&result, value, line); err != nil {
+		return runResult{}, err
+	}
+	return result, nil
+}
+
+func csvValue(row []string, columns map[string]int, name string) string {
+	index, ok := columns[name]
+	if !ok || index >= len(row) {
+		return ""
+	}
+	return strings.TrimSpace(row[index])
+}
+
+func parseCSVInt(value, column string, line int) (int, error) {
+	if value == "" {
+		return 0, nil
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, fmt.Errorf("line %d column %s: %w", line, column, err)
+	}
+	return parsed, nil
+}
+
+func parseCSVFloat(value, column string, line int) (float64, error) {
+	if value == "" {
+		return 0, nil
+	}
+	parsed, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return 0, fmt.Errorf("line %d column %s: %w", line, column, err)
+	}
+	if math.IsNaN(parsed) || math.IsInf(parsed, 0) {
+		return 0, fmt.Errorf("line %d column %s: non-finite value", line, column)
+	}
+	return parsed, nil
+}
+
+func parseCSVNumberFields(result *runResult, parseInt func(string) (int, error), parseFloat func(string) (float64, error)) error {
+	intFields := []struct {
+		name string
+		to   *int
+	}{
+		{"threads", &result.ThreadCount}, {"run", &result.Repetition}, {"exit_code", &result.ExitCode},
+		{"client_prompt_tokens", &result.Client.PromptTokens}, {"client_reasoning_tokens", &result.Client.ReasoningTokens},
+		{"turns", &result.Client.Turns}, {"out_tokens", &result.Client.OutTokens},
+		{"tasks", &result.Llama.TaskCount}, {"slots_used", &result.Llama.SlotsUsed},
+		{"cancelled_tasks", &result.Llama.CancelledTasks}, {"max_concurrent_tasks", &result.Llama.MaxConcurrentTasks},
+		{"large_prefill_events", &result.Llama.LargePrefillEvents}, {"decode_starvation_events", &result.Llama.DecodeStarvationEvents},
+		{"fit_spill_blocks", &result.FitSpillBlocks},
+	}
+	for _, field := range intFields {
+		value, err := parseInt(field.name)
+		if err != nil {
+			return err
+		}
+		*field.to = value
+	}
+	return assignCSVFloatFields(result, parseFloat)
+}
+
+func assignCSVFloatFields(result *runResult, parseFloat func(string) (float64, error)) error {
+	floatFields := []struct {
+		name string
+		to   *float64
+	}{
+		{"wall_s", &result.WallSeconds}, {"client_reported_s", &result.Client.ReportedSeconds},
+		{"prompt_s", &result.Llama.PromptSeconds}, {"prompt_tps", &result.Llama.PromptTPSWeighted},
+		{"summed_eval_s", &result.Llama.EvalSecondsSummed}, {"task_tg_weighted", &result.Llama.TaskTGWeighted},
+		{"min_tg3s", &result.Llama.MinTG3s}, {"metrics_wall_gen_tps", &result.Metrics.WallGenerationTPS},
+		{"max_requests_processing", &result.Metrics.MaxRequestsProcessing},
+		{"max_requests_deferred", &result.Metrics.MaxRequestsDeferred}, {"max_context", &result.Metrics.MaxContextObserved},
+		{"mem_mean_read_gbs", &result.Memory.MeanRead}, {"mem_max_read_gbs", &result.Memory.MaxRead},
+		{"mem_mean_write_gbs", &result.Memory.MeanWrite}, {"gpu_mean_util_pct", &result.GPU.MeanUtil},
+		{"gpu_max_util_pct", &result.GPU.MaxUtil}, {"gpu_mean_power_w", &result.GPU.MeanPower},
+		{"gpu_max_power_w", &result.GPU.MaxPower},
+	}
+	for _, field := range floatFields {
+		value, err := parseFloat(field.name)
+		if err != nil {
+			return err
+		}
+		*field.to = value
+	}
+	return nil
+}
+
+func parseCSVTokenFields(result *runResult, value func(string) string, line int) error {
+	fields := []struct {
+		name string
+		to   *int64
+	}{
+		{"prompt_tokens", &result.Llama.PromptTokens},
+		{"generated_tokens", &result.Llama.GeneratedTokens},
+	}
+	for _, field := range fields {
+		if value(field.name) == "" {
+			continue
+		}
+		parsed, err := strconv.ParseInt(value(field.name), 10, 64)
+		if err != nil {
+			return fmt.Errorf("line %d column %s: %w", line, field.name, err)
+		}
+		*field.to = parsed
+	}
+	return nil
+}
+
 func renderAnalysisReport(results []runResult, minRuns int) string {
+	ordered := sortedAnalysisGroups(results)
+	var b strings.Builder
+	fmt.Fprintf(&b, "# Benchmark analysis\n\nInput: %d counted runs across %d configuration/thread cells. Latency leader requires at least %d successful runs.\n\n", len(results), len(ordered), minRuns)
+	writeAnalysisCellResults(&b, ordered, minRuns)
+	writePreserveComparisons(&b, ordered)
+	writeSampleCoverage(&b, ordered, minRuns)
+	b.WriteString("\n`task decode tok/s` is per-task decode throughput. `wall gen tok/s` includes gaps between client requests. DDR values are zero when memory profiling was unavailable or disabled.\n")
+	return b.String()
+}
+
+func sortedAnalysisGroups(results []runResult) []*analysisGroup {
 	groups := make(map[string]*analysisGroup)
 	for _, result := range results {
 		name, identity, preserveKey, preserveOn := groupIdentity(result)
@@ -589,9 +694,10 @@ func renderAnalysisReport(results []runResult, minRuns int) string {
 		}
 		return ordered[i].thread < ordered[j].thread
 	})
+	return ordered
+}
 
-	var b strings.Builder
-	fmt.Fprintf(&b, "# Benchmark analysis\n\nInput: %d counted runs across %d configuration/thread cells. Latency leader requires at least %d successful runs.\n\n", len(results), len(groups), minRuns)
+func writeAnalysisCellResults(b *strings.Builder, ordered []*analysisGroup, minRuns int) {
 	var leader *analysisGroup
 	for _, group := range ordered {
 		summary := summarizeAnalysisGroup(group)
@@ -601,18 +707,20 @@ func renderAnalysisReport(results []runResult, minRuns int) string {
 	}
 	if leader != nil {
 		s := summarizeAnalysisGroup(leader)
-		fmt.Fprintf(&b, "Best observed cell by median end-to-end wall time: **%s, %d threads** — %.2fs median (%d/%d successful runs).\n\n", leader.name, leader.thread, s.MedianWall, s.Success, s.Runs)
+		fmt.Fprintf(b, "Best observed cell by median end-to-end wall time: **%s, %d threads** — %.2fs median (%d/%d successful runs).\n\n", leader.name, leader.thread, s.MedianWall, s.Success, s.Runs)
 	}
 	b.WriteString("## Cell results\n\n")
 	b.WriteString("| configuration | threads | ok/runs | median wall | p95 wall | median task decode tok/s | median wall gen tok/s | median prompt tok/s | median client prompt tokens | median output tokens | GPU util | DDR read GB/s |\n")
 	b.WriteString("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
 	for _, group := range ordered {
 		s := summarizeAnalysisGroup(group)
-		fmt.Fprintf(&b, "| %s | %d | %d/%d | %.2fs | %.2fs | %.2f | %.2f | %.1f | %.0f | %.0f | %.1f%% | %.2f |\n",
+		fmt.Fprintf(b, "| %s | %d | %d/%d | %.2fs | %.2fs | %.2f | %.2f | %.1f | %.0f | %.0f | %.1f%% | %.2f |\n",
 			group.name, group.thread, s.Success, s.Runs, s.MedianWall, s.P95Wall, s.MedianTaskTG, s.MedianWallTG,
 			s.MedianPromptTPS, s.MedianClientPrompt, s.MedianOutputTokens, s.MedianGPUUtil, s.MedianMemRead)
 	}
+}
 
+func writePreserveComparisons(b *strings.Builder, ordered []*analysisGroup) {
 	b.WriteString("\n## Preserve-thinking comparisons\n\n")
 	b.WriteString("Matched cells compare the same configuration and thread count, with only preserve-thinking changed. Positive token deltas mean preserve-thinking used more tokens.\n\n")
 	b.WriteString("| configuration | threads | off/on runs | client prompt tokens off → on | delta | wall seconds off → on | delta | output tokens off → on |\n")
@@ -625,12 +733,15 @@ func renderAnalysisReport(results []runResult, minRuns int) string {
 			off, on := summarizeAnalysisGroup(pair.off), summarizeAnalysisGroup(pair.on)
 			promptDelta := percentDelta(off.MedianClientPrompt, on.MedianClientPrompt)
 			wallDelta := percentDelta(off.MedianWall, on.MedianWall)
-			fmt.Fprintf(&b, "| %s | %d | %d/%d, %d/%d | %.0f → %.0f | %+.1f%% | %.2f → %.2f | %+.1f%% | %.0f → %.0f |\n",
+			fmt.Fprintf(b, "| %s | %d | %d/%d, %d/%d | %.0f → %.0f | %+.1f%% | %.2f → %.2f | %+.1f%% | %.0f → %.0f |\n",
 				pair.name, pair.off.thread, off.Success, off.Runs, on.Success, on.Runs,
 				off.MedianClientPrompt, on.MedianClientPrompt, promptDelta,
 				off.MedianWall, on.MedianWall, wallDelta, off.MedianOutputTokens, on.MedianOutputTokens)
 		}
 	}
+}
+
+func writeSampleCoverage(b *strings.Builder, ordered []*analysisGroup, minRuns int) {
 	b.WriteString("\n## Sample coverage\n\n")
 	b.WriteString("| configuration | threads measured | cells complete at requested minimum |\n|---|---|---:|\n")
 	coverage := make(map[string]map[int]bool)
@@ -660,10 +771,8 @@ func renderAnalysisReport(results []runResult, minRuns int) string {
 		for _, thread := range threads {
 			threadLabels = append(threadLabels, strconv.Itoa(thread))
 		}
-		fmt.Fprintf(&b, "| %s | %s | %d/%d |\n", name, strings.Join(threadLabels, ", "), complete, len(threads))
+		fmt.Fprintf(b, "| %s | %s | %d/%d |\n", name, strings.Join(threadLabels, ", "), complete, len(threads))
 	}
-	b.WriteString("\n`task decode tok/s` is per-task decode throughput. `wall gen tok/s` includes gaps between client requests. DDR values are zero when memory profiling was unavailable or disabled.\n")
-	return b.String()
 }
 
 type analysisSummary struct {

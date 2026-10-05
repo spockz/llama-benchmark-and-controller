@@ -1,0 +1,22 @@
+[Unit]
+Description=llama.cpp single-model router (Qwen3.6 Q3_K_M / IQ4_XS)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+WorkingDirectory=%h/sources/llama.cpp
+Environment=GGML_VK_VISIBLE_DEVICES=0
+ExecStartPre=/usr/bin/test -r %h/.config/llama-modelctl/models.ini
+ExecStartPre=/usr/bin/test -r %h/.config/llama-modelctl/server.env
+ExecStartPre=/usr/bin/grep -Eq ^LLAMA_SERVER_HOST=. %h/.config/llama-modelctl/server.env
+EnvironmentFile=%h/.config/llama-modelctl/server.env
+ExecStart=%h/sources/llama.cpp/build-vulkan/bin/llama-server --models-preset %h/.config/llama-modelctl/models.ini --models-max 1 --no-models-autoload --parallel 1 --host ${LLAMA_SERVER_HOST} --port 1234 --metrics
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=45s
+
+[Install]
+WantedBy=default.target

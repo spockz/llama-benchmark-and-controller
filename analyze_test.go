@@ -136,14 +136,7 @@ func TestValidateAnalysisMatrixChecksExactCartesianCells(t *testing.T) {
 }
 
 func TestGeneratePairwisePlanCoversEveryCrossAxisValuePair(t *testing.T) {
-	manifest := analysisMatrixManifest{
-		Models: []string{"model-a", "model-b"}, Contexts: []int{65536, 131072},
-		Threads: []int{6, 8}, Parallel: []int{1, 2}, Batches: []int{256, 512},
-		UBatches: []int{128, 256}, FitTargets: []int{256, 512},
-		CacheReuse: []int{0}, FlashAttention: []string{"on"}, UnifiedKV: []bool{true},
-		KVPerSlot: []int{204800}, KVK: []string{"q4_0", "q5_1"},
-		KVV: []string{"q4_0", "q5_1"}, PreserveThinking: []bool{false, true},
-	}
+	manifest := pairwiseTestManifest()
 	plan, err := generatePairwisePlan(manifest)
 	if err != nil {
 		t.Fatal(err)
@@ -155,6 +148,22 @@ func TestGeneratePairwisePlanCoversEveryCrossAxisValuePair(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	assertEveryPairCovered(t, plan, factors)
+}
+
+func pairwiseTestManifest() analysisMatrixManifest {
+	return analysisMatrixManifest{
+		Models: []string{"model-a", "model-b"}, Contexts: []int{65536, 131072},
+		Threads: []int{6, 8}, Parallel: []int{1, 2}, Batches: []int{256, 512},
+		UBatches: []int{128, 256}, FitTargets: []int{256, 512},
+		CacheReuse: []int{0}, FlashAttention: []string{"on"}, UnifiedKV: []bool{true},
+		KVPerSlot: []int{204800}, KVK: []string{"q4_0", "q5_1"},
+		KVV: []string{"q4_0", "q5_1"}, PreserveThinking: []bool{false, true},
+	}
+}
+
+func assertEveryPairCovered(t *testing.T, plan []coverageCell, factors []coverageFactor) {
+	t.Helper()
 	covered := make(map[string]bool)
 	for _, cell := range plan {
 		values := []string{

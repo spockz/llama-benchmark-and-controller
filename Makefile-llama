@@ -51,7 +51,7 @@ HF               ?= $(QWEN36_IQ3)
 ALIAS            ?= qwen36-coder
 
 # ---- Runtime defaults ----
-HOST             ?= 192.168.1.122
+HOST             ?=
 PORT             ?= 1234
 CTX              ?= 32768
 THREADS          ?= 12
@@ -170,6 +170,7 @@ BENCH_RUNTIME = \
 	build-rocm build-vulkan build-all rebuild-all clean-rocm clean-vulkan \
 	doctor devices devices-rocm devices-vulkan versions \
 	serve-rocm serve-vulkan serve-rocm-think serve-vulkan-think \
+	serve-rocm-run serve-vulkan-run serve-rocm-think-run serve-vulkan-think-run \
 	serve-vulkan-qwen36-32k serve-vulkan-qwen36-32k-think \
 	serve-vulkan-qwen36-64k-think \
 	serve-vulkan-qwen36-128k-q5-think \
@@ -284,15 +285,59 @@ doctor:
 
 # ---- Generic servers ----
 serve-rocm:
-	$(ROCM_SERVER) $(SERVER_BASE) $(SERVER_NONTHINK) $(EXTRA_SERVER_ARGS)
+	@if [ -n "$(HOST)" ]; then \
+	  $(MAKE) -f $(SELF_MAKEFILE) HOST="$(HOST)" serve-rocm-run; \
+	elif [ -t 0 ]; then \
+	  read -r -p 'What host/IP should llama-server bind to? ' host; \
+	  test -n "$$host" || { echo 'A bind host is required.' >&2; exit 2; }; \
+	  $(MAKE) -f $(SELF_MAKEFILE) HOST="$$host" serve-rocm-run; \
+	else \
+	  echo 'Set HOST to the llama-server bind IP/host.' >&2; exit 2; \
+	fi
 
 serve-vulkan:
-	$(VULKAN_SERVER) $(SERVER_BASE) $(SERVER_NONTHINK) $(EXTRA_SERVER_ARGS)
+	@if [ -n "$(HOST)" ]; then \
+	  $(MAKE) -f $(SELF_MAKEFILE) HOST="$(HOST)" serve-vulkan-run; \
+	elif [ -t 0 ]; then \
+	  read -r -p 'What host/IP should llama-server bind to? ' host; \
+	  test -n "$$host" || { echo 'A bind host is required.' >&2; exit 2; }; \
+	  $(MAKE) -f $(SELF_MAKEFILE) HOST="$$host" serve-vulkan-run; \
+	else \
+	  echo 'Set HOST to the llama-server bind IP/host.' >&2; exit 2; \
+	fi
 
 serve-rocm-think:
-	$(ROCM_SERVER) $(SERVER_BASE) $(SERVER_THINK) $(EXTRA_SERVER_ARGS)
+	@if [ -n "$(HOST)" ]; then \
+	  $(MAKE) -f $(SELF_MAKEFILE) HOST="$(HOST)" serve-rocm-think-run; \
+	elif [ -t 0 ]; then \
+	  read -r -p 'What host/IP should llama-server bind to? ' host; \
+	  test -n "$$host" || { echo 'A bind host is required.' >&2; exit 2; }; \
+	  $(MAKE) -f $(SELF_MAKEFILE) HOST="$$host" serve-rocm-think-run; \
+	else \
+	  echo 'Set HOST to the llama-server bind IP/host.' >&2; exit 2; \
+	fi
 
 serve-vulkan-think:
+	@if [ -n "$(HOST)" ]; then \
+	  $(MAKE) -f $(SELF_MAKEFILE) HOST="$(HOST)" serve-vulkan-think-run; \
+	elif [ -t 0 ]; then \
+	  read -r -p 'What host/IP should llama-server bind to? ' host; \
+	  test -n "$$host" || { echo 'A bind host is required.' >&2; exit 2; }; \
+	  $(MAKE) -f $(SELF_MAKEFILE) HOST="$$host" serve-vulkan-think-run; \
+	else \
+	  echo 'Set HOST to the llama-server bind IP/host.' >&2; exit 2; \
+	fi
+
+serve-rocm-run:
+	$(ROCM_SERVER) $(SERVER_BASE) $(SERVER_NONTHINK) $(EXTRA_SERVER_ARGS)
+
+serve-vulkan-run:
+	$(VULKAN_SERVER) $(SERVER_BASE) $(SERVER_NONTHINK) $(EXTRA_SERVER_ARGS)
+
+serve-rocm-think-run:
+	$(ROCM_SERVER) $(SERVER_BASE) $(SERVER_THINK) $(EXTRA_SERVER_ARGS)
+
+serve-vulkan-think-run:
 	$(VULKAN_SERVER) $(SERVER_BASE) $(SERVER_THINK) $(EXTRA_SERVER_ARGS)
 
 

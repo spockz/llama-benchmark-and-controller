@@ -26,7 +26,26 @@ export HOME="$open_code_state/home"
 export XDG_CONFIG_HOME="$open_code_state/config"
 export XDG_DATA_HOME="$open_code_state/data"
 export XDG_CACHE_HOME="$open_code_state/cache"
-export OPENCODE_CONFIG="${OPENCODE_CONFIG:-$bundle_dir/opencode.json}"
+if [[ -z "${OPENCODE_CONFIG:-}" ]]; then
+  llama_base_url="${LLAMA_BASE_URL:-}"
+  if [[ -z "$llama_base_url" && -t 0 ]]; then
+    read -r -p 'What llama-server base URL should OpenCode use (for example http://host:1234/v1)? ' llama_base_url
+  fi
+  if [[ -z "$llama_base_url" ]]; then
+    echo 'Set OPENCODE_CONFIG or LLAMA_BASE_URL to choose the llama-server URL.' >&2
+    exit 2
+  fi
+  if [[ ! "$llama_base_url" =~ ^https?://(\[[0-9A-Fa-f:]+\]|[[:alnum:].-]+)(:[0-9]+)?/v1/?$ ]]; then
+    echo 'Enter an http(s) URL ending in /v1.' >&2
+    exit 2
+  fi
+  escaped_url=${llama_base_url//\\/\\\\}
+  escaped_url=${escaped_url//&/\\&}
+  escaped_url=${escaped_url//|/\\|}
+  OPENCODE_CONFIG="$work_dir/opencode.json"
+  sed "s|http://<your-ip>:1234/v1|$escaped_url|g" "$bundle_dir/opencode.json" > "$OPENCODE_CONFIG"
+fi
+export OPENCODE_CONFIG
 export OPENCODE_DISABLE_PROJECT_CONFIG=1
 export GOENV="$go_state/env"
 export GOCACHE="$go_state/build"
